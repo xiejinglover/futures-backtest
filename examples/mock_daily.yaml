@@ -1,0 +1,26 @@
+data:
+  adapter: mock
+  options: {root: sample_data}
+  underlyings: [RB]
+  start: 2024-04-01
+  end: 2024-04-12
+  bar_freq: 1d
+portfolio:
+  initial_cash: 200000
+  margins_default: 0.1
+routing:
+  dominant_lag: 1          # 交易日 T 使用 T-1 认定的主力
+  roll_timing: next_open
+  allow_signals_on_roll_day: true
+  lookahead_dominant: false
+execution:
+  market_fill: next_open
+  slippage_ticks: 1
+  on_margin_short: reject
+strategy:
+  # 随包分发的示例策略，pip 安装后无需本仓库源码即可运行
+  path: futures_backtest.contrib.strategies:BuyAndHoldUnderlying
+  parameters: {underlying: RB, lots: 2, warmup: 1}
+output:
+  root: backtests/mock-daily
+  seed: 7

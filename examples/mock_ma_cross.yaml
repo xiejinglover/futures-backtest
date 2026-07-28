@@ -1,0 +1,24 @@
+data:
+  adapter: mock
+  options: {root: sample_data}
+  underlyings: [RB]
+  start: 2024-04-01
+  end: 2024-04-12
+  bar_freq: 1d
+portfolio:
+  initial_cash: 200000
+  margins_default: 0.1
+routing:
+  dominant_lag: 1
+  roll_timing: same_close
+  allow_signals_on_roll_day: false
+execution:
+  market_fill: same_close
+  slippage_ticks: 1
+  on_margin_short: scale
+strategy:
+  path: futures_backtest.contrib.strategies:MovingAverageCross
+  parameters: {underlying: RB, window: 3, lots: 1, allow_short: true}
+output:
+  root: backtests/mock-ma-cross
+  seed: 7

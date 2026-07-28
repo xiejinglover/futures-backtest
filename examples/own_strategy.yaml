@@ -1,0 +1,24 @@
+# 策略来自使用方自己的项目（examples/strategies.py），与本配置同级。
+# CLI 会把配置所在目录加入 sys.path，因此在任何工作目录下都能跑。
+data:
+  adapter: mock
+  options: {root: sample_data}
+  underlyings: [RB]
+  start: 2024-04-01
+  end: 2024-04-12
+  bar_freq: 1d
+portfolio:
+  initial_cash: 200000
+  margins_default: 0.1
+routing:
+  dominant_lag: 1
+  roll_timing: next_open
+execution:
+  market_fill: next_open
+  slippage_ticks: 1
+strategy:
+  path: strategies:BreakoutWithStop
+  parameters: {underlying: RB, entry_window: 4, exit_window: 2, lots: 1}
+output:
+  root: backtests/own-strategy
+  seed: 7

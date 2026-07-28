@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "futures-backtest"
+version = "0.1.0"
+description = "Underlying-level signals in, contract-level fills out: a reproducible futures backtesting framework"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "xiejinglover"}]
+keywords = ["futures", "backtesting", "quant", "trading", "cta", "rollover"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Financial and Insurance Industry",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial :: Investment",
+  "Typing :: Typed",
+]
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "pydantic>=2.7",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=15"]
+mysql = ["SQLAlchemy>=2.0", "PyMySQL>=1.1"]
+dev = ["pytest>=8", "ruff>=0.6", "build>=1.2"]
+
+[project.urls]
+Homepage = "https://github.com/xiejinglover/futures-backtest"
+Changelog = "https://github.com/xiejinglover/futures-backtest/blob/main/CHANGELOG.md"
+Issues = "https://github.com/xiejinglover/futures-backtest/issues"
+
+[project.scripts]
+futures-backtest = "futures_backtest.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["futures_backtest*"]
+
+[tool.setuptools.package-data]
+futures_backtest = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4"]

@@ -1,0 +1,63 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[parquet,dev]"
+      - name: Lint
+        run: python -m ruff check .
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Run examples backed by the shipped contrib strategies
+        run: |
+          futures-backtest validate --config examples/mock_daily.yaml
+          futures-backtest run --config examples/mock_daily.yaml
+          futures-backtest validate --config examples/mock_ma_cross.yaml
+          futures-backtest run --config examples/mock_ma_cross.yaml
+      - name: Run the example whose strategy lives next to its config
+        run: |
+          python -m futures_backtest validate --config examples/own_strategy.yaml
+          python -m futures_backtest run --config examples/own_strategy.yaml
+      - name: Check dependency consistency
+        run: python -m pip check
+      - name: Build and inspect wheel
+        run: |
+          python -m pip wheel . --no-deps -w wheelhouse
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("wheelhouse").glob("futures_backtest-*.whl"))
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+              metadata_name = next(n for n in names if n.endswith(".dist-info/METADATA"))
+              metadata = archive.read(metadata_name).decode()
+
+          assert not any(n.startswith(("tests/", "examples/")) for n in names), names
+          assert "futures_backtest/contrib/strategies.py" in names, names
+          assert "futures_backtest/py.typed" in names, names
+          assert "License-Expression: MIT" in metadata, metadata
+          PY
