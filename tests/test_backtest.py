@@ -183,6 +183,54 @@ def test_targets_can_be_skipped_on_a_roll_day(tmp_path, tables):
     assert result.metrics["skipped_targets"] == 1
 
 
+def test_a_limit_the_next_bar_never_reaches_loses_the_signal(tmp_path, tables):
+    """The fixture trends up, so a bid under yesterday's close is never hit."""
+    result = _run(
+        tmp_path,
+        tables,
+        strategy="tests.support:LimitStrategy",
+        parameters={"offset_ticks": 2},
+    )
+    fills = _frame(result, "fills")
+    assert (fills["reject_reason"] == "limit_not_reached").all()
+    assert (fills["filled_lots"] == 0).all()
+
+    skipped = _frame(result, "skipped_targets")
+    assert set(skipped["reason"]) == {"limit_not_reached"}
+    assert len(skipped) == len(fills)
+    assert result.metrics["final_equity"] == pytest.approx(result.metrics["initial_cash"])
+
+
+def test_a_marketable_limit_fills_at_the_open_and_beats_the_market_order(tmp_path, tables):
+    limited = _run(
+        tmp_path / "limit",
+        tables,
+        strategy="tests.support:LimitStrategy",
+        parameters={"offset_ticks": -10},
+    )
+    fills = _frame(limited, "fills")
+    signals = fills[fills["reason"] == "signal"]
+    assert not signals.empty
+    assert (signals["status"] == "filled").all()
+    assert (signals["slippage_ticks"] == 0).all()
+
+    market = _run(tmp_path / "market", tables)
+    market_signals = _frame(market, "fills")
+    market_signals = market_signals[market_signals["reason"] == "signal"]
+    # Same bar, same lots: the limit saves exactly the one tick of slippage.
+    assert signals.iloc[0]["price"] == pytest.approx(market_signals.iloc[0]["price"] - 1)
+
+
+def test_a_limit_price_cannot_be_filled_at_the_same_close(tmp_path, tables):
+    with pytest.raises(BacktestDataError, match="look-ahead"):
+        _run(
+            tmp_path,
+            tables,
+            strategy="tests.support:LimitStrategy",
+            execution={"market_fill": "same_close"},
+        )
+
+
 def test_history_is_cut_off_at_the_current_bar(tmp_path, tables):
     config = config_for(tables, strategy="tests.support:PeekingStrategy", output_root=tmp_path)
     from futures_backtest import Scheduler, build_dataset

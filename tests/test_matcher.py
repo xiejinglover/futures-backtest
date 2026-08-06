@@ -13,7 +13,9 @@ from tests.support import bar_rows, make_parts, trading_days, two_contract_table
 TIMESTAMP = datetime(2024, 4, 2, 15, 0)
 
 
-def _order(day, side="buy", offset="open", lots=1, price=3500.0, symbol="RB2405"):
+def _order(
+    day, side="buy", offset="open", lots=1, price=3500.0, symbol="RB2405", limit_price=None
+):
     return Order(
         trading_day=day,
         timestamp=TIMESTAMP,
@@ -24,6 +26,7 @@ def _order(day, side="buy", offset="open", lots=1, price=3500.0, symbol="RB2405"
         lots=lots,
         reference_price=price,
         reason="signal",
+        limit_price=limit_price,
     )
 
 
@@ -160,6 +163,121 @@ def test_a_close_splits_into_yesterday_and_today_at_their_own_fee_rates():
     per_lot_close_today = fills[1].commission
     assert per_lot_close_today == pytest.approx(per_lot_close * 10)
     assert all(fill.status == "filled" for fill in fills)
+
+
+# -- limit orders ---------------------------------------------------------
+# The day-0 bar of RB2405 is open 3495, high 3502, low 3493, close 3500.
+
+
+def _limit_parts(days, **execution):
+    return make_parts(two_contract_tables(days, days[2]), **execution)
+
+
+def test_a_limit_the_bar_trades_through_fills_at_the_limit_without_slippage():
+    days = trading_days(4)
+    dataset, account, _, matcher = _limit_parts(days)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    fill = matcher.execute(_order(days[0], "buy", price=3495.0, limit_price=3494.0), bar, account)[
+        0
+    ]
+    assert fill.status == "filled"
+    assert fill.price == pytest.approx(3494.0)
+    assert fill.slippage_ticks == 0.0
+
+
+def test_a_sell_limit_uses_the_high_of_the_bar():
+    days = trading_days(4)
+    dataset, account, _, matcher = _limit_parts(days)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    matcher.execute(_order(days[0], "buy", lots=1, price=3495.0), bar, account)
+    fill = matcher.execute(
+        _order(days[0], "sell", offset="close", price=3495.0, limit_price=3501.0), bar, account
+    )[0]
+    assert fill.price == pytest.approx(3501.0)
+    # 3503 is above the day's high of 3502, so nobody ever lifted that offer.
+    missed = matcher.execute(
+        _order(days[0], "sell", offset="close", price=3495.0, limit_price=3503.0), bar, account
+    )[0]
+    assert missed.reject_reason == "limit_not_reached"
+
+
+def test_a_limit_the_bar_never_reaches_is_rejected_and_reports_the_limit():
+    days = trading_days(4)
+    dataset, account, _, matcher = _limit_parts(days)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    rejected = matcher.execute(
+        _order(days[0], "buy", price=3495.0, limit_price=3492.0), bar, account
+    )[0]
+    assert rejected.status == "rejected"
+    assert rejected.reject_reason == "limit_not_reached"
+    assert rejected.price == pytest.approx(3492.0)
+    assert account.net_lots("RB") == 0
+
+
+def test_touching_the_low_only_fills_under_the_optimistic_rule():
+    days = trading_days(4)
+    # The day's low is exactly 3493, so this is the queue-position question.
+    strict_data, strict_account, _, strict = _limit_parts(days)
+    bar = strict_data.last_bar_of_day("RB2405", days[0])
+    order = _order(days[0], "buy", price=3495.0, limit_price=3493.0)
+    assert strict.execute(order, bar, strict_account)[0].reject_reason == "limit_not_reached"
+
+    loose_data, loose_account, _, loose = _limit_parts(days, limit_fill_rule="touch")
+    bar = loose_data.last_bar_of_day("RB2405", days[0])
+    filled = loose.execute(
+        _order(days[0], "buy", price=3495.0, limit_price=3493.0), bar, loose_account
+    )[0]
+    assert filled.status == "filled"
+    assert filled.price == pytest.approx(3493.0)
+
+
+def test_a_bar_that_opens_through_the_limit_fills_at_the_open():
+    days = trading_days(4)
+    dataset, account, _, matcher = _limit_parts(days)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    # Bidding 3600 for a market that opens at 3495: the resting order is
+    # marketable, so the gap accrues to the trader rather than the limit.
+    fill = matcher.execute(_order(days[0], "buy", price=3495.0, limit_price=3600.0), bar, account)[
+        0
+    ]
+    assert fill.price == pytest.approx(3495.0)
+    assert fill.slippage_ticks == 0.0
+
+
+def test_an_off_grid_limit_is_snapped_the_unaggressive_way():
+    days = trading_days(4)
+    dataset, account, _, matcher = _limit_parts(days)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    # 3493.9 rounds down to 3493, which the low only touches, so no fill. Rounding
+    # up to 3494 instead would have invented a fill the strategy never asked for.
+    rejected = matcher.execute(
+        _order(days[0], "buy", price=3495.0, limit_price=3493.9), bar, account
+    )[0]
+    assert rejected.reject_reason == "limit_not_reached"
+    assert rejected.price == pytest.approx(3493.0)
+
+
+def test_a_limit_order_is_still_refused_on_a_locked_bar():
+    days = trading_days(4)
+    tables = two_contract_tables(days, days[2])
+    tables["bars"] = pd.DataFrame(
+        bar_rows(
+            "RB2405", "RB", days, [3500 + 10 * i for i in range(len(days))], limits=(3495, 3200)
+        )
+        + bar_rows("RB2410", "RB", days, [3560 + 10 * i for i in range(len(days))])
+    )
+    dataset, account, _, matcher = make_parts(tables)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    rejected = matcher.execute(
+        _order(days[0], "buy", price=3495.0, limit_price=3494.0), bar, account
+    )[0]
+    assert rejected.reject_reason == "limit_up"
 
 
 def test_zero_lot_orders_are_rejected_rather_than_silently_dropped():

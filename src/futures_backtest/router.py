@@ -128,6 +128,11 @@ class Router:
         The comparison is against the underlying's *total* net exposure, so a
         position still parked on a retired contract is netted rather than
         double-counted.
+
+        A ``limit_price`` on the target only reaches the order routed to the
+        current contract. Leftovers unwinding on a retired month trade at their
+        own price level, where an absolute limit meant for another contract would
+        be meaningless, so those stay market orders.
         """
         underlying = target.underlying
         symbol = self.trading_symbol(underlying, day)
@@ -176,6 +181,7 @@ class Router:
                     lots=remaining,
                     reference_price=price_of[symbol],
                     reason="signal",
+                    limit_price=target.limit_price,
                 )
             )
         return orders

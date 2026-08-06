@@ -147,6 +147,29 @@ data:
 | `execution.slippage_ticks` | 滑点，按最小变动价位计，方向始终不利于自己 |
 | `execution.on_margin_short` | 保证金不足时 `reject` 还是 `scale`（缩手数） |
 | `execution.enforce_price_limits` | 涨停不可买、跌停不可卖 |
+| `execution.limit_fill_rule` | 限价单成交判定：`penetrate`（击穿才算，默认）或 `touch`（触及即算） |
+
+### 限价单
+
+策略在 `TargetPosition` 上给出 `limit_price` 即为限价单，不给就是市价单：
+
+```python
+bar = context.bar("RB")
+return TargetPosition(
+    underlying="RB",
+    net_lots=2,
+    limit_price=bar.close - 2 * context.tick_size("RB"),
+)
+```
+
+限价单是**当日有效**的：次日若未成交即撤单，该笔信号作废并记入
+`skipped_targets.csv`（`reason=limit_not_reached`），不会顺延。判定只用次日那根
+bar：跳空开在限价之内按开盘价成交，否则看最高/最低价是否按 `limit_fill_rule`
+达到限价。限价只作用于路由到当前主力合约的信号单，换月、到期强平以及旧合约上的
+残留清理单一律走市价。
+
+因为决策当天的 bar 不能同时用来证明成交，`limit_price` 与
+`execution.market_fill: same_close` 组合会直接报错。
 
 ## 输出
 

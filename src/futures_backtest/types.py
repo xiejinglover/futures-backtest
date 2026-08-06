@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
@@ -51,16 +52,26 @@ class TargetPosition:
 
     Positive is long, negative is short, zero is flat. The strategy never names a
     month contract; the router resolves one.
+
+    ``limit_price`` turns the resulting order into a day limit order on the routed
+    contract. Leaving it ``None`` keeps the default market behaviour.
     """
 
     underlying: str
     net_lots: int
+    limit_price: float | None = None
 
     def __post_init__(self) -> None:
         if not self.underlying:
             raise ValueError("TargetPosition.underlying must not be empty")
         if int(self.net_lots) != self.net_lots:
             raise ValueError("TargetPosition.net_lots must be a whole number of lots")
+        if self.limit_price is not None:
+            if not math.isfinite(self.limit_price) or self.limit_price <= 0:
+                raise ValueError(
+                    "TargetPosition.limit_price must be a positive finite price, "
+                    f"got {self.limit_price!r}"
+                )
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,7 @@ class Order:
     lots: int
     reference_price: float
     reason: str  # "signal" | "roll_out" | "roll_in" | "expiry"
+    limit_price: float | None = None  # None means market order
 
 
 @dataclass(frozen=True)

@@ -191,7 +191,23 @@ class Scheduler:
                 )
                 continue
             orders = self.router.signal_orders(target, day, timestamp, self.account, prices)
-            self._submit(orders, bars)
+            fills = self._submit(orders, bars)
+            # A day limit the bar never reached is simply cancelled at the close,
+            # so the signal is lost rather than carried. Record it: the share of
+            # signals a limit misses is the main cost of trading passively.
+            for fill in fills:
+                if fill.reject_reason != "limit_not_reached":
+                    continue
+                self.skipped_targets.append(
+                    {
+                        "signal_day": signal_day,
+                        "execution_day": day,
+                        "underlying": target.underlying,
+                        "net_lots": target.net_lots,
+                        "reason": "limit_not_reached",
+                        "limit_price": fill.price,
+                    }
+                )
 
     def _decide(self, day: date, timestamp: datetime, bars: dict[str, Bar]) -> list[TargetPosition]:
         routing = self._routing(day)
@@ -209,9 +225,24 @@ class Scheduler:
             underlyings=tuple(self.config.data.underlyings),
             _history=self.dataset.history,
             _routing=routing,
+            _tick_sizes={
+                underlying: self.dataset.contracts[symbol].tick_size
+                for underlying, symbol in routing.items()
+                if symbol in self.dataset.contracts
+            },
         )
         result = self.strategy.on_bar(context)
-        return normalize_targets(result, tuple(self.config.data.underlyings))
+        targets = normalize_targets(result, tuple(self.config.data.underlyings))
+        if self.config.execution.market_fill == "same_close" and any(
+            target.limit_price is not None for target in targets
+        ):
+            raise BacktestDataError(
+                "a limit price cannot be combined with execution.market_fill="
+                "'same_close': the decision is taken at the close of the very bar "
+                "that would have to prove the fill, so any resting fill would be "
+                "look-ahead. Use market_fill='next_open' for limit orders"
+            )
+        return targets
 
     def _settle(self, day: date) -> AccountSnapshot:
         for symbol in {position.symbol for position in self.account.open_positions()}:

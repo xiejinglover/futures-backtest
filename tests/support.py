@@ -241,6 +241,31 @@ class FlipStrategy:
         )
 
 
+class LimitStrategy:
+    """Holds a fixed net position, but asks for it with a day limit order.
+
+    ``offset_ticks`` is subtracted from the last close, so a positive value asks
+    for a better price than the market last traded at and a negative one is
+    already marketable when the next bar opens.
+    """
+
+    def __init__(self, parameters: dict[str, Any] | None = None):
+        self.parameters = dict(parameters or {})
+
+    def on_bar(self, context):  # noqa: ANN001
+        from futures_backtest import TargetPosition
+
+        bar = context.bar("RB")
+        if bar is None:
+            return None
+        offset = float(self.parameters.get("offset_ticks", 2))
+        return TargetPosition(
+            underlying="RB",
+            net_lots=int(self.parameters.get("lots", 2)),
+            limit_price=bar.close - offset * context.tick_size("RB"),
+        )
+
+
 class StrayStrategy:
     """Targets an underlying that is not configured; the framework must refuse."""
 

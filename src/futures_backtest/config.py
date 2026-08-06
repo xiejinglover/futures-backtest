@@ -64,6 +64,9 @@ class ExecutionConfig(StrictModel):
     slippage_ticks: float = Field(default=1.0, ge=0)
     on_margin_short: Literal["reject", "scale"] = "reject"
     enforce_price_limits: bool = True
+    # Daily bars hide queue position, so a limit that the day's extreme merely
+    # touches usually would not have been filled. "penetrate" is the honest default.
+    limit_fill_rule: Literal["touch", "penetrate"] = "penetrate"
 
 
 class StrategyConfig(StrictModel):

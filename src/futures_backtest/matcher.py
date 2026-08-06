@@ -43,7 +43,17 @@ class Matcher:
             if locked is not None:
                 return [self._reject(order, reference, locked)]
 
-        price, slippage_ticks = self._fill_price(order.side, reference, info.tick_size, bar)
+        if order.limit_price is None:
+            price, slippage_ticks = self._fill_price(order.side, reference, info.tick_size, bar)
+        else:
+            limit = self._align_limit(order.side, order.limit_price, info.tick_size)
+            reached = self._limit_fill_price(order.side, limit, bar)
+            if reached is None:
+                return [self._reject(order, limit, "limit_not_reached")]
+            # A limit order pays no slippage: it either got the price it asked for
+            # or a better one on a gap. Reporting the gap gain as slippage would
+            # feed a negative cost into the roll cost aggregation.
+            price, slippage_ticks = self._clamp_to_limits(reached, bar), 0.0
 
         if order.offset == "open":
             direction = "long" if order.side == "buy" else "short"
@@ -93,12 +103,46 @@ class Matcher:
         self, side: str, reference: float, tick: float, bar: Bar
     ) -> tuple[float, float]:
         sign = 1.0 if side == "buy" else -1.0
-        price = _align(reference + sign * self.config.slippage_ticks * tick, tick, side)
+        price = self._clamp_to_limits(
+            _align(reference + sign * self.config.slippage_ticks * tick, tick, side), bar
+        )
+        return price, abs(price - reference) / tick
+
+    def _clamp_to_limits(self, price: float, bar: Bar) -> float:
         if bar.upper_limit is not None:
             price = min(price, bar.upper_limit)
         if bar.lower_limit is not None:
             price = max(price, bar.lower_limit)
-        return price, abs(price - reference) / tick
+        return price
+
+    def _align_limit(self, side: str, limit: float, tick: float) -> float:
+        """Snap a limit onto the tick grid without making the order more aggressive.
+
+        This is the mirror image of :func:`_align`, which snaps a *fill* price and
+        therefore rounds the expensive way. Here a buy limit rounds down and a sell
+        limit rounds up, so an off-grid request can only ever fill less often.
+        """
+        steps = limit / tick
+        aligned = math.floor(steps + EPSILON) if side == "buy" else math.ceil(steps - EPSILON)
+        return round(aligned * tick, 10)
+
+    def _limit_fill_price(self, side: str, limit: float, bar: Bar) -> float | None:
+        """Where a day limit order would have filled, or ``None`` if it never did.
+
+        A bar that opens through the limit fills at the open, because by then the
+        resting order is marketable. Otherwise the day's extreme has to reach the
+        limit, and ``limit_fill_rule`` decides whether merely touching it counts.
+        """
+        touch = self.config.limit_fill_rule == "touch"
+        if side == "buy":
+            if bar.open <= limit + EPSILON:
+                return bar.open
+            reached = bar.low <= limit + EPSILON if touch else bar.low < limit - EPSILON
+            return limit if reached else None
+        if bar.open >= limit - EPSILON:
+            return bar.open
+        reached = bar.high >= limit - EPSILON if touch else bar.high > limit + EPSILON
+        return limit if reached else None
 
     # -- costs and limits -------------------------------------------------
 

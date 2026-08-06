@@ -26,6 +26,7 @@ class StrategyContext:
     underlyings: tuple[str, ...]
     _history: Any
     _routing: dict[str, str]
+    _tick_sizes: dict[str, float]
 
     def bar(self, underlying: str) -> Bar | None:
         """The current bar of the contract the framework is trading, if any."""
@@ -42,6 +43,13 @@ class StrategyContext:
         if symbol is None:
             raise BacktestDataError(f"no routed contract for {underlying} on {self.trading_day}")
         return symbol
+
+    def tick_size(self, underlying: str) -> float:
+        """Minimum price increment of the routed contract, for pricing limits."""
+        tick = self._tick_sizes.get(underlying)
+        if tick is None:
+            raise BacktestDataError(f"no routed contract for {underlying} on {self.trading_day}")
+        return tick
 
     def net_lots(self, underlying: str) -> int:
         return self.account.net_lots.get(underlying, 0)
