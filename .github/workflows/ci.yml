@@ -37,6 +37,8 @@ jobs:
           futures-backtest run --config examples/mock_daily.yaml
           futures-backtest validate --config examples/mock_ma_cross.yaml
           futures-backtest run --config examples/mock_ma_cross.yaml
+          futures-backtest validate --config examples/mock_intraday.yaml
+          futures-backtest run --config examples/mock_intraday.yaml
       - name: Run the example whose strategy lives next to its config
         run: |
           python -m futures_backtest validate --config examples/own_strategy.yaml

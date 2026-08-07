@@ -1,0 +1,34 @@
+data:
+  adapter: mock
+  options: {root: sample_data_intraday}
+  underlyings: [RB]
+  start: 2024-04-08
+  end: 2024-04-12
+  # The engine never resamples: this must be the period the source really has.
+  bar_freq: 15m
+portfolio:
+  initial_cash: 200000
+  margins_default: 0.1
+routing:
+  dominant_lag: 1
+  roll_timing: next_open
+  allow_signals_on_roll_day: true
+execution:
+  # Limit orders need next_open: a decision taken at a bar's close cannot also be
+  # proved by that same bar's low.
+  market_fill: next_open
+  slippage_ticks: 1
+  limit_fill_rule: penetrate
+  on_margin_short: reject
+strategy:
+  path: futures_backtest.contrib.strategies:IntradayRangeBreakout
+  parameters:
+    underlying: RB
+    lots: 2
+    opening_bars: 4
+    flat_after: "14:00"
+    # Drop this to 0 to enter at market and fill every breakout instead.
+    limit_offset_ticks: 3
+output:
+  root: backtests/mock-intraday
+  seed: 11

@@ -1,0 +1,2 @@
+underlying,symbol,trading_day,open_fee_rate,open_fee_per_lot,close_fee_rate,close_fee_per_lot,close_today_fee_rate,close_today_fee_per_lot
+RB,,,0.0001,0,0.0001,0,0.001,0

@@ -1,0 +1,3 @@
+symbol,underlying,multiplier,tick_size,exchange,expire_date
+RB2405,RB,10,1,SHFE,2024-05-15
+RB2410,RB,10,1,SHFE,2024-10-15

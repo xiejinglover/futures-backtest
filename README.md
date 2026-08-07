@@ -54,7 +54,7 @@ python -m pip install "futures-backtest[parquet,mysql]"
 
 ## 运行
 
-装完包即可跑：包内随附两个示例策略
+装完包即可跑：包内随附三个示例策略
 （`futures_backtest.contrib.strategies`），只需要一份配置和一份数据。
 
 ```bash
@@ -79,8 +79,22 @@ result = run_backtest(BacktestConfig.model_validate(payload))
 print(result.metrics["total_return"])
 ```
 
-仓库自带一份 mock 数据（1 个品种、2 个合约、一次主力切换），
-`examples/mock_daily.yaml` 可直接运行，用来演示格式与换月行为，不代表真实收益。
+### 随附示例
+
+仓库自带两份 mock 数据，四份配置都可直接运行，只演示格式与行为，不代表真实收益。
+
+| 配置 | 演示什么 |
+|---|---|
+| [`mock_daily.yaml`](examples/mock_daily.yaml) | 最小可运行例子：`BuyAndHoldUnderlying` 跑日线 |
+| [`mock_ma_cross.yaml`](examples/mock_ma_cross.yaml) | `same_close` 换月与成交、换月日不接新信号、保证金不足缩手数 |
+| [`mock_intraday.yaml`](examples/mock_intraday.yaml) | 日内 T+0：15m bar、夜盘归属、跨 bar 挂单、平今费率 |
+| [`own_strategy.yaml`](examples/own_strategy.yaml) | 策略写在使用方自己的项目里（`examples/strategies.py`） |
+
+日内那份值得单独看一眼输出：入场时刻会出现 `2024-04-10 22:30` 却归属交易日
+`2024-04-11`（夜盘属于次日）；平仓一律是 `close_today` 且手续费是开仓的十倍（上期所
+螺纹钢平今费率就是普通费率的 10 倍，日内策略的毛利很容易被它吃光）；`rolls.csv` 是
+空的而 `events.csv` 里有 `ROLL`——收盘前平光的策略换月时手上没仓位，自然不付移仓
+成本。数据说明见 [`sample_data_intraday/README.md`](examples/sample_data_intraday/README.md)。
 
 ## 策略接口
 

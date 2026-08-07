@@ -22,6 +22,10 @@
 - **新增** `execution.volume_participation`：单笔最多吃掉一根 bar 成交量的比例，
   超出部分 `partial`，压到 0 手以 `no_liquidity` 拒单；默认关闭。
 - **移除** `data.history_bars`：从未被任何代码读取的死配置。
+- **新增日内示例**：`examples/mock_intraday.yaml` + `examples/sample_data_intraday/`
+  （15m、含夜盘、5 个交易日、一次换月），策略
+  `futures_backtest.contrib.strategies:IntradayRangeBreakout` 开盘区间突破、收盘前
+  平光。已接入 CI。
 
 ## 0.1.0
 
