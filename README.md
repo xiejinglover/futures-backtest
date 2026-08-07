@@ -148,6 +148,32 @@ data:
 | `execution.on_margin_short` | 保证金不足时 `reject` 还是 `scale`（缩手数） |
 | `execution.enforce_price_limits` | 涨停不可买、跌停不可卖 |
 | `execution.limit_fill_rule` | 限价单成交判定：`penetrate`（击穿才算，默认）或 `touch`（触及即算） |
+| `execution.check_margin_on_submit` | 挂单时即按限价估算保证金，覆盖不了就拒单；默认开 |
+| `execution.volume_participation` | 单笔最多吃掉一根 bar 成交量的比例；默认 `None`（不限） |
+| `data.bar_freq` | `1d`（默认）/ `1m` / `5m` / `15m` / `30m` / `1h`；框架不重采样 |
+
+### 日内回测（T+0）
+
+`bar_freq` 设成日内周期即可在一天内任意时点开平仓——期货本来就没有 T+1 锁定，缺的
+只是一天内的第二个决策点。每根 bar 都会调 `on_bar`，返回 `None` 表示不动作；要节流
+用 `context.bars_seen` 自理。框架**不做重采样**，数据源给什么周期就回放什么周期，
+配了日内周期却喂日线数据会直接报错。
+
+每根 bar 的顺序：检验挂单簿 → 上一根 bar 的市价目标按本 bar 开盘价成交 → `on_bar`
+决策 → 目标变了才撤旧单重挂。当日首根 bar 额外做今仓滚昨仓、`next_open` 换月与
+到期强平，末根 bar 额外做 `same_close` 换月、撤光挂单与日终结算。结算仍是每交易日
+一次。日线数据下首根即末根，行为与之前完全一致。
+
+夜盘属于下一交易日，因此数据的 `trading_day` 必须按交易所口径标注，今昨仓切换点才
+会落在夜盘开盘那一刻，见 [docs/data-contract.md](docs/data-contract.md)。
+
+想用日线信号驱动分钟级执行，给 `context.history()` 传 `freq`：
+
+```python
+daily = context.history("RB", bars=20, symbol=context.trading_symbol("RB"), freq="1d")
+```
+
+游标所在的那个周期按已走完的部分返回——盘中确实知道"今日至此的最高价"，不是未来函数。
 
 ### 限价单
 
@@ -162,28 +188,44 @@ return TargetPosition(
 )
 ```
 
-限价单是**当日有效**的：次日若未成交即撤单，该笔信号作废并记入
-`skipped_targets.csv`（`reason=limit_not_reached`），不会顺延。判定只用次日那根
-bar：跳空开在限价之内按开盘价成交，否则看最高/最低价是否按 `limit_fill_rule`
-达到限价。限价只作用于路由到当前主力合约的信号单，换月、到期强平以及旧合约上的
-残留清理单一律走市价。
+委托**存续到当日收盘**，逐根 bar 检验：跳空开在限价之内按开盘价成交，否则看最高/
+最低价是否按 `limit_fill_rule` 达到限价。收盘仍未成交即撤单，信号作废并记入
+`skipped_targets.csv`（`reason=limit_not_reached`），不顺延到下一日，也不支持
+跨日 GTC。
 
-因为决策当天的 bar 不能同时用来证明成交，`limit_price` 与
+目标没变就不重挂——否则持仓目标型策略每根 bar 重发同一目标会把挂单每分钟撤一次
+重挂，成交率就成了 bar 周期的函数而非市场的函数。目标变了会撤旧单重挂
+（`reason=superseded`），`same_close` 换月也会撤掉旧合约上的在途单
+（`reason=cancelled_on_roll`）。
+
+限价只作用于路由到当前主力合约的信号单，换月、到期强平以及旧合约上的残留清理单一律
+走市价。因为决策当天的 bar 不能同时用来证明成交，`limit_price` 与
 `execution.market_fill: same_close` 组合会直接报错。
 
 ## 输出
 
 每次运行在 `output.root/<run_id>/` 下写：`orders.csv`、`fills.csv`、`rolls.csv`、
 `events.csv`（`BAR` / `ROLL` / `SETTLE`）、`nav.csv`、`skipped_targets.csv`、
-`metrics.json`、`metadata.json`、`config.json`。
+`trades.csv`、`metrics.json`、`metadata.json`、`config.json`。
 
 `nav.csv` 的 `unrealized_pnl` 在日终通常为 0：结算把持仓成本重置为结算价，浮动盈亏
 每天通过 `settlement_variation` 落进现金，这与交易所每日无负债结算一致。
 
+`trades.csv` 是回合级记录（入场/出场时刻与价格、持仓时长、毛利、分摊手续费），
+按合约与方向 FIFO 配对得到。**它与 `fills.csv` 口径不同，不可逐笔相减**：结算每天
+把持仓成本重置为结算价，所以 `fills.csv` 的 `realized_pnl` 只含最后一段，之前各段
+在 `nav.csv` 的 `settlement_variation` 里；`trades.csv` 是入场到出场的全程。只有
+`sum(realized_pnl) + sum(settlement_variation) - sum(commission)` 才等于权益变化。
+
 ## 当前边界
 
-- Phase 1 只回放**日线**。配置 `bar_freq: 1m` 会直接报错而不是悄悄只取每天最后一根
-  bar；分钟级事件推进属于 Phase 2。
+- 一根 bar 的 OHLC 说不出高低点谁先发生。引擎按距开盘价远近推断路径（近的极值先
+  到），这是**假设**，缩短周期只能减轻不能消除。
+- 没有排队模型。`penetrate` 与 `volume_participation` 都只是排队失败与深度的粗糙
+  代理，不表达排队位置。
+- 挂单时校验的保证金**不冻结**，价格大幅不利变动后成交时仍可能不足。
+- 不支持止损单与跨日 GTC，两者都需要显式的 TIF 字段。
+- `events.csv` 行数随 bar 数线性增长，1m 一年约 6 万行。
 - 策略看到的是**被路由合约的真实 bar**。用于特征的复权连续序列（signal view）属于
   Phase 2，届时仍不参与撮合。
 - 主力映射表最好比回测区间多一段历史，否则回测首日没有"前一日认定"可用，框架会退用

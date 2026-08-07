@@ -1,5 +1,28 @@
 # Changelog
 
+## 未发布
+
+- **日内回测（T+0）**：`data.bar_freq` 放开为 `1d / 1m / 5m / 15m / 30m / 1h`，
+  调度器改为逐 bar 回放，一天内可在任意时点开平仓。首根 bar 做今仓滚昨仓、换月与
+  到期强平，末根 bar 做收盘换月、撤单与结算，结算仍每交易日一次。日线数据下每天
+  一根 bar，产出与 0.1.0 逐字节一致。框架不重采样，配了日内周期却喂日线数据会报错。
+- **挂单簿**：限价单存续到当日收盘并逐根 bar 检验，不再是"当根 bar 有效"。目标没变
+  就不重挂，变了撤旧重挂（`superseded`），`same_close` 换月撤旧合约在途单
+  （`cancelled_on_roll`）。
+- **`trades.csv`**：回合级记录，含入场/出场时刻与价格、持仓时长、毛利与分摊手续费；
+  指标新增 `round_trips` / `round_trip_win_rate` / `average_holding_minutes`。
+  注意它与 `fills.csv` 是两套口径，见 README。
+- **`history(freq=...)`**：把原始 bar 聚合成更粗周期，供日线信号 + 分钟执行的策略；
+  按交易日而非自然日划分，游标所在周期按已走完的部分返回。
+- **`history()` 提速**：改为在预排序切片上二分，从每次全表过滤变为对数查找。
+- **行为变更** — 成交价压回 `[bar.low, bar.high]`：滑点不再能把成交推到 bar 之外。
+  日线上罕见，1m 上收在极值是常态。
+- **行为变更** — `execution.check_margin_on_submit`（默认开）：覆盖不了的限价单在
+  挂单阶段即以 `insufficient_margin` 拒掉，不再挂上去等成交时才发现。
+- **新增** `execution.volume_participation`：单笔最多吃掉一根 bar 成交量的比例，
+  超出部分 `partial`，压到 0 手以 `no_liquidity` 拒单；默认关闭。
+- **移除** `data.history_bars`：从未被任何代码读取的死配置。
+
 ## 0.1.0
 
 首个版本：品种层信号进、具体合约成交出的日频期货回测框架，以 MIT 许可开源，
