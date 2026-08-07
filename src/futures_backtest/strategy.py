@@ -33,9 +33,18 @@ class StrategyContext:
         return self.bars.get(underlying)
 
     def history(
-        self, underlying: str, bars: int | None = None, symbol: str | None = None
+        self,
+        underlying: str,
+        bars: int | None = None,
+        symbol: str | None = None,
+        freq: str | None = None,
     ) -> pd.DataFrame:
-        return self._history(underlying, self.timestamp, bars, symbol)
+        """Past bars, optionally folded into a coarser period than the source.
+
+        ``freq`` is how a minute-bar strategy reads a daily signal. The period
+        containing the current bar is included as far as it has run.
+        """
+        return self._history(underlying, self.timestamp, bars, symbol, freq)
 
     def trading_symbol(self, underlying: str) -> str:
         """Read-only: which month contract the router is using right now."""

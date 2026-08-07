@@ -303,6 +303,36 @@ def test_a_limit_order_is_still_refused_on_a_locked_bar():
     assert rejected.reject_reason == "limit_up"
 
 
+def test_the_participation_cap_turns_an_oversized_order_into_a_partial_fill():
+    days = trading_days(4)
+    tables = two_contract_tables(days, days[2])
+    tables["bars"] = pd.DataFrame(
+        bar_rows("RB2405", "RB", days, [3500] * len(days), volume=1000)
+        + bar_rows("RB2410", "RB", days, [3560] * len(days), volume=1000)
+    )
+    dataset, account, _, _ = make_parts(tables)
+    matcher = Matcher(dataset, ExecutionConfig(volume_participation=0.01))
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    fill = matcher.execute(_order(days[0], "buy", lots=40), bar, account)[0]
+    assert fill.filled_lots == 10
+    assert fill.status == "partial"
+
+
+def test_a_bar_too_thin_for_a_single_lot_rejects_for_want_of_liquidity():
+    days = trading_days(4)
+    tables = two_contract_tables(days, days[2])
+    tables["bars"] = pd.DataFrame(
+        bar_rows("RB2405", "RB", days, [3500] * len(days), volume=50)
+        + bar_rows("RB2410", "RB", days, [3560] * len(days), volume=50)
+    )
+    dataset, account, _, _ = make_parts(tables)
+    matcher = Matcher(dataset, ExecutionConfig(volume_participation=0.01))
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    assert matcher.execute(_order(days[0], "buy"), bar, account)[0].reject_reason == "no_liquidity"
+
+
 def test_zero_lot_orders_are_rejected_rather_than_silently_dropped():
     days = trading_days(4)
     dataset, account, _, matcher = make_parts(two_contract_tables(days, days[2]))

@@ -17,6 +17,103 @@ from .types import (
     DataAdapter,
 )
 
+_PERIODS = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "60min", "1d": ""}
+
+_ROLLUP_COLUMNS = (
+    "symbol",
+    "underlying",
+    "datetime",
+    "trading_day",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "open_interest",
+)
+
+
+def _period_keys(frame: pd.DataFrame, freq: str) -> Any:
+    """Which coarse period each row belongs to.
+
+    A day is the exchange's trading day rather than the calendar day, so a night
+    session folds into the session it belongs to instead of the evening it fell on.
+    """
+    if freq == "1d":
+        return frame["trading_day"].to_numpy()
+    return frame["datetime"].dt.floor(_PERIODS[freq]).to_numpy()
+
+
+class _Rollup:
+    """Streaming OHLCV aggregation over a slice, folded once and reused.
+
+    Row order is by time, so a period's rows are contiguous and a period is
+    finished the moment a later one appears. Finished periods are folded away
+    for good; only the one the cursor sits inside is recomputed per call.
+    """
+
+    def __init__(self, keys: Any):
+        self.keys = keys
+        self.done = 0
+        self.order: list[tuple[str, Any]] = []
+        self.closed: dict[tuple[str, Any], dict[str, Any]] = {}
+
+    def upto(self, frame: pd.DataFrame, end: int) -> pd.DataFrame:
+        if end <= 0:
+            return pd.DataFrame(columns=list(_ROLLUP_COLUMNS))
+        if end < self.done:
+            self.done, self.order, self.closed = 0, [], {}
+        cut = end
+        while cut > 0 and self.keys[cut - 1] == self.keys[end - 1]:
+            cut -= 1
+        for index in range(self.done, cut):
+            _fold(self.closed, self.order, self.keys[index], frame.iloc[index])
+        self.done = max(self.done, cut)
+
+        open_order = list(self.order)
+        overlay = dict(self.closed)
+        for index in range(cut, end):
+            _fold(overlay, open_order, self.keys[index], frame.iloc[index], copy_on_write=True)
+        return pd.DataFrame(
+            [overlay[key] for key in open_order], columns=list(_ROLLUP_COLUMNS)
+        )
+
+
+def _fold(
+    into: dict[tuple[str, Any], dict[str, Any]],
+    order: list[tuple[str, Any]],
+    period: Any,
+    row: Any,
+    copy_on_write: bool = False,
+) -> None:
+    key = (str(row.symbol), period)
+    slot = into.get(key)
+    if slot is None:
+        into[key] = {
+            "symbol": str(row.symbol),
+            "underlying": str(row.underlying),
+            "datetime": row.datetime,
+            "trading_day": row.trading_day,
+            "open": float(row.open),
+            "high": float(row.high),
+            "low": float(row.low),
+            "close": float(row.close),
+            "volume": float(row.volume),
+            "open_interest": row.open_interest,
+        }
+        order.append(key)
+        return
+    if copy_on_write:
+        slot = dict(slot)
+        into[key] = slot
+    slot["datetime"] = row.datetime
+    slot["trading_day"] = row.trading_day
+    slot["high"] = max(slot["high"], float(row.high))
+    slot["low"] = min(slot["low"], float(row.low))
+    slot["close"] = float(row.close)
+    slot["volume"] += float(row.volume)
+    slot["open_interest"] = row.open_interest
+
 
 def _fee_lookup(
     frame: pd.DataFrame | None,
@@ -176,6 +273,7 @@ class MarketDataset:
         self._margins = _fee_lookup(tables.get("margins"))
         self.settle_fallbacks = 0
         self._slices: dict[tuple[str, str | None], tuple[pd.DataFrame, Any]] = {}
+        self._rollups: dict[tuple[str, str | None, str], _Rollup] = {}
 
     # -- calendar ---------------------------------------------------------
 
@@ -293,17 +391,46 @@ class MarketDataset:
         cutoff: datetime,
         bars: int | None = None,
         symbol: str | None = None,
+        freq: str | None = None,
     ) -> pd.DataFrame:
         """Rows up to and including ``cutoff``; never anything later.
 
         Binary search on a cached, pre-sorted slice: an intraday run asks this
         once per bar, so scanning the whole table each time would make the
         backtest quadratic in the number of bars.
+
+        ``freq`` folds the rows into a coarser period, for a strategy that wants
+        a daily signal while trading minute bars. The period that ``cutoff``
+        falls inside is returned as it stands so far, which is not look-ahead:
+        halfway through a session one really does know the session's high to
+        that point.
         """
         frame, times = self._slice(underlying, symbol)
         end = int(np.searchsorted(times, pd.Timestamp(cutoff).to_datetime64(), side="right"))
+        if freq is not None:
+            frame = self._rollup(underlying, symbol, freq, end)
+            end = len(frame)
         start = max(0, end - bars) if bars is not None else 0
         return frame.iloc[start:end].reset_index(drop=True)
+
+    def _rollup(self, underlying: str, symbol: str | None, freq: str, end: int) -> pd.DataFrame:
+        """Aggregate the first ``end`` rows of a slice into ``freq`` periods.
+
+        Periods are closed as the cursor passes them and never revisited, so a
+        call costs the number of periods rather than the number of bars.
+        """
+        if freq not in _PERIODS:
+            raise BacktestDataError(
+                f"history(freq={freq!r}) is not a known period; use one of "
+                f"{', '.join(sorted(_PERIODS))}"
+            )
+        frame, _ = self._slice(underlying, symbol)
+        key = (underlying, symbol, freq)
+        state = self._rollups.get(key)
+        if state is None:
+            state = _Rollup(_period_keys(frame, freq))
+            self._rollups[key] = state
+        return state.upto(frame, end)
 
     def describe(self) -> dict[str, Any]:
         return {

@@ -72,6 +72,10 @@ class ExecutionConfig(StrictModel):
     # only an estimate at the limit price, and nothing is frozen, so a fill can
     # still be short of margin if the market moves against the account first.
     check_margin_on_submit: bool = True
+    # Share of a bar's volume one order may take. Off by default: it is a crude
+    # stand-in for depth, and a wrong guess is worse than none. It caps size
+    # only, and says nothing about queue position.
+    volume_participation: float | None = Field(default=None, gt=0, le=1)
 
 
 class StrategyConfig(StrictModel):

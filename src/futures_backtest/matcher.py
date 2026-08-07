@@ -82,9 +82,13 @@ class Matcher:
             # feed a negative cost into the roll cost aggregation.
             price, slippage_ticks = self._clamp_to_limits(reached, bar), 0.0
 
+        capacity = self._capacity(order, bar)
+        if capacity <= 0:
+            return [self._reject(order, price, "no_liquidity")]
+
         if order.offset == "open":
             direction = "long" if order.side == "buy" else "short"
-            lots = self._openable_lots(order, account, direction, price)
+            lots = min(self._openable_lots(order, account, direction, price), capacity)
             if lots <= 0:
                 return [self._reject(order, price, "insufficient_margin")]
             commission = self._commission(order.symbol, order.trading_day, "open", lots, price)
@@ -93,7 +97,7 @@ class Matcher:
 
         direction = closing_direction(order.side)
         held = account.position(order.symbol, direction).lots
-        lots = min(order.lots, held)
+        lots = min(order.lots, held, capacity)
         if lots <= 0:
             return [self._reject(order, price, "insufficient_position")]
         yesterday, today = account.close_lots_split(order.symbol, direction, lots)
@@ -231,6 +235,18 @@ class Matcher:
             rate_key, lot_key = "close_fee_rate", "close_fee_per_lot"
         notional = lots * info.multiplier * price
         return notional * charge.get(rate_key, 0.0) + lots * charge.get(lot_key, 0.0)
+
+    def _capacity(self, order: Order, bar: Bar) -> int:
+        """Lots this bar can absorb under the participation cap.
+
+        A size limit, not a queue model: it stops a strategy from claiming a
+        whole bar's turnover, but says nothing about where in the queue the
+        order stood.
+        """
+        share = self.config.volume_participation
+        if share is None:
+            return order.lots
+        return int(math.floor(bar.volume * share + EPSILON))
 
     def _openable_lots(self, order: Order, account: Account, direction: str, price: float) -> int:
         required = account.margin_for(order.symbol, direction, order.lots, price, order.trading_day)

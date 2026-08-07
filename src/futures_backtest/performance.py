@@ -139,6 +139,13 @@ def compute_metrics(frames: dict[str, pd.DataFrame], initial_cash: float) -> dic
         gross_profit = float(wins["realized_pnl"].sum())
         gross_loss = float(-closes[closes["realized_pnl"] < 0]["realized_pnl"].sum())
         metrics["profit_factor"] = (gross_profit / gross_loss) if gross_loss > 0 else None
+    trades = frames.get("trades")
+    if trades is not None and not trades.empty:
+        # Entry to exit, unlike the fill-level figures above, which settlement
+        # resets every evening. See docs/features.md 5.7 before comparing them.
+        metrics["round_trips"] = int(len(trades))
+        metrics["round_trip_win_rate"] = float((trades["net_pnl"] > 0).mean())
+        metrics["average_holding_minutes"] = float(trades["holding_minutes"].mean())
     return metrics
 
 

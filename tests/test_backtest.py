@@ -296,6 +296,7 @@ def test_outputs_include_every_artefact(tmp_path, tables):
         "events.csv",
         "nav.csv",
         "skipped_targets.csv",
+        "trades.csv",
         "metrics.json",
         "metadata.json",
         "config.json",

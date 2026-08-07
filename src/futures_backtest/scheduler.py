@@ -18,6 +18,7 @@ from .matcher import Matcher, path_reach
 from .performance import compute_metrics, write_outputs
 from .router import Router
 from .strategy import Strategy, StrategyContext, load_strategy, normalize_targets
+from .trades import TradeLedger
 from .types import (
     AccountSnapshot,
     BacktestDataError,
@@ -67,6 +68,9 @@ class Scheduler:
         self.events: list[dict[str, Any]] = []
         self.nav: list[dict[str, Any]] = []
         self.book = RestingOrders()
+        self.ledger = TradeLedger(
+            {symbol: info.multiplier for symbol, info in dataset.contracts.items()}
+        )
         # Carried to the *next bar*, which on a daily dataset is the next day.
         self.pending_targets: list[tuple[date, TargetPosition]] = []
         self.skipped_targets: list[dict[str, Any]] = []
@@ -102,6 +106,8 @@ class Scheduler:
     def _execute(self, order: Order, bar: Bar) -> list[Fill]:
         fills = self.matcher.execute(order, bar, self.account)
         self.fills.extend(fills)
+        for fill in fills:
+            self.ledger.record(fill)
         return fills
 
     def _submit(self, orders: list[Order], bars: dict[str, Bar]) -> list[Fill]:
@@ -428,6 +434,7 @@ class Scheduler:
             "events": pd.DataFrame(self.events),
             "nav": pd.DataFrame(self.nav),
             "skipped_targets": pd.DataFrame(self.skipped_targets),
+            "trades": pd.DataFrame([asdict(trade) for trade in self.ledger.trades]),
         }
 
 

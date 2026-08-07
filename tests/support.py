@@ -151,6 +151,62 @@ def two_contract_tables(
     }
 
 
+def intraday_tables(
+    days: list[date],
+    switch_day: date,
+    *,
+    shape: tuple[float, ...] = (0, 6, 12, 4, -4),
+    step_minutes: int = 5,
+    volume: float = 100000,
+) -> dict[str, pd.DataFrame]:
+    """The two-contract fixture cut into several bars per trading day.
+
+    ``shape`` is each bar's close as an offset from the day's opening price, so a
+    test can steer the path within the day: the default rises and then falls back
+    through where it started, which is what a resting bid needs to be filled.
+    """
+    tables = two_contract_tables(days, switch_day)
+    rows = []
+    for symbol, base in (("RB2405", 3500), ("RB2410", 3560)):
+        for index, day in enumerate(days):
+            opening = base + 10 * index
+            previous = 0.0
+            start = datetime.combine(day, datetime.min.time()) + timedelta(hours=9)
+            for slot, offset in enumerate(shape):
+                open_price = opening + previous
+                close = opening + offset
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "underlying": "RB",
+                        "datetime": start + timedelta(minutes=step_minutes * slot),
+                        "trading_day": day,
+                        "open": open_price,
+                        "high": max(open_price, close) + 1,
+                        "low": min(open_price, close) - 1,
+                        "close": close,
+                        "volume": volume,
+                        "open_interest": 200000,
+                        "upper_limit": None,
+                        "lower_limit": None,
+                    }
+                )
+                previous = offset
+    bars = pd.DataFrame(rows)
+    tables["bars"] = bars
+    tables["settles"] = pd.DataFrame(
+        [
+            {
+                "symbol": str(symbol),
+                "trading_day": day,
+                "settle_price": float(group["close"].iloc[-1]),
+            }
+            for (symbol, day), group in bars.groupby(["symbol", "trading_day"], sort=True)
+        ]
+    )
+    return tables
+
+
 def trading_days(count: int = 6, start: date = date(2024, 4, 1)) -> list[date]:
     days: list[date] = []
     cursor = start
@@ -264,6 +320,44 @@ class LimitStrategy:
             net_lots=int(self.parameters.get("lots", 2)),
             limit_price=bar.close - offset * context.tick_size("RB"),
         )
+
+
+class FixedLimitStrategy:
+    """Asks for the same lots at the same absolute price on every single bar.
+
+    Re-emitting an unchanged target is what a position-target strategy does, so
+    this is the case where the order has to stay working rather than be re-placed.
+    """
+
+    def __init__(self, parameters: dict[str, Any] | None = None):
+        self.parameters = dict(parameters or {})
+
+    def on_bar(self, context):  # noqa: ANN001
+        from futures_backtest import TargetPosition
+
+        return TargetPosition(
+            underlying="RB",
+            net_lots=int(self.parameters.get("lots", 2)),
+            limit_price=float(self.parameters["limit_price"]),
+        )
+
+
+class IntradayTurnStrategy:
+    """Opens at one slot of the trading day and flattens at another, every day."""
+
+    def __init__(self, parameters: dict[str, Any] | None = None):
+        self.parameters = dict(parameters or {})
+
+    def on_bar(self, context):  # noqa: ANN001
+        from futures_backtest import TargetPosition
+
+        slots = int(self.parameters.get("bars_per_day", 5))
+        slot = (context.bars_seen - 1) % slots
+        if slot == int(self.parameters.get("open_slot", 1)):
+            return TargetPosition(underlying="RB", net_lots=int(self.parameters.get("lots", 2)))
+        if slot == int(self.parameters.get("close_slot", 3)):
+            return TargetPosition(underlying="RB", net_lots=0)
+        return None
 
 
 class StrayStrategy:
