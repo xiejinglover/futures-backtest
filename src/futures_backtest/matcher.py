@@ -161,6 +161,11 @@ class Matcher:
         price = self._clamp_to_limits(
             _align(reference + sign * self.config.slippage_ticks * tick, tick, side), bar
         )
+        # A fill outside the bar contradicts the bar: the high is by definition
+        # the highest price that traded, so a buy filled above it would have
+        # raised the high itself. Rare on daily bars, routine on minute bars,
+        # where closing on the extreme is common.
+        price = min(max(price, bar.low), bar.high)
         return price, abs(price - reference) / tick
 
     def _clamp_to_limits(self, price: float, bar: Bar) -> float:

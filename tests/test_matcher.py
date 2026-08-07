@@ -53,6 +53,29 @@ def test_a_price_off_the_tick_grid_is_snapped_the_expensive_way():
     assert matcher.execute(_order(days[0], "sell", price=3500.4), bar, account)[0].price == 3500
 
 
+def test_slippage_cannot_push_a_fill_outside_the_bar():
+    """The high is the highest price that traded, so no fill can sit above it."""
+    days = trading_days(4)
+    tables = two_contract_tables(days, days[2])
+    near = bar_rows("RB2405", "RB", days, [3500 + 10 * i for i in range(len(days))])
+    for row in near:
+        row["high"] = row["close"]
+        row["low"] = row["open"]
+    tables["bars"] = pd.DataFrame(
+        near + bar_rows("RB2410", "RB", days, [3560 + 10 * i for i in range(len(days))])
+    )
+    dataset, account, _, matcher = make_parts(tables)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    buy = matcher.execute(_order(days[0], "buy", price=bar.close), bar, account)[0]
+    assert buy.price == pytest.approx(bar.high)
+    # The slippage the trader could not actually pay is not reported as paid.
+    assert buy.slippage_ticks == pytest.approx(0.0)
+
+    sell = matcher.execute(_order(days[0], "sell", price=bar.low), bar, account)[0]
+    assert sell.price == pytest.approx(bar.low)
+
+
 def test_a_buy_at_the_upper_limit_is_rejected():
     days = trading_days(4)
     tables = two_contract_tables(days, days[2])
