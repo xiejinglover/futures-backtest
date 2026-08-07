@@ -4,16 +4,17 @@ import json
 import os
 import platform
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from typing import Any
 
 import pandas as pd
 
 from .account import Account
+from .book import RestingOrders, Working
 from .config import BacktestConfig
 from .dataset import MarketDataset, build_dataset
-from .matcher import Matcher
+from .matcher import Matcher, path_reach
 from .performance import compute_metrics, write_outputs
 from .router import Router
 from .strategy import Strategy, StrategyContext, load_strategy, normalize_targets
@@ -31,27 +32,19 @@ from .types import (
 )
 
 
-def check_supported(config: BacktestConfig) -> None:
-    """Phase 1 replays one bar per trading day; refuse rather than silently sample.
-
-    An intraday dataset driven by this loop would quietly use only each day's last
-    bar, so intraday support is an explicit Phase 2 item instead of a wrong number.
-    """
-    if config.data.bar_freq != "1d":
-        raise BacktestDataError(
-            f"data.bar_freq={config.data.bar_freq!r} is not supported yet: the "
-            "scheduler replays one bar per trading day (docs/features.md 5.5, "
-            "Phase 2). Aggregate the source to daily bars, or keep bar_freq=1d"
-        )
-
-
 class Scheduler:
     """Replays bars in order and emits ``BAR`` / ``ROLL`` / ``SETTLE`` events.
 
-    One trading day runs as: open phase (rolls, expiries, orders carried from the
-    previous close), close phase (strategy decision), then settlement. Signals are
-    carried as *targets*, not as pre-resolved orders, so a target decided before a
-    roll is executed against the contract that is actually routed on fill day.
+    Every bar runs as: cross the resting limit orders, execute the targets carried
+    from the previous bar, ask the strategy, then place whatever it asked for. The
+    first bar of a trading day additionally rolls today's lots into yesterday's and
+    handles rolls and expiries; the last bar cancels what is still working and
+    settles. A daily dataset has one bar per day, so that sequence collapses into
+    the open-phase / close-phase / settle day the engine has always run.
+
+    Signals are carried as *targets*, not as pre-resolved orders, so a target
+    decided before a roll is executed against the contract that is actually routed
+    when it fills.
     """
 
     def __init__(
@@ -60,7 +53,6 @@ class Scheduler:
         dataset: MarketDataset,
         strategy: Strategy,
     ):
-        check_supported(config)
         self.config = config
         self.dataset = dataset
         self.strategy = strategy
@@ -74,6 +66,8 @@ class Scheduler:
         self.rolls: list[RollLog] = []
         self.events: list[dict[str, Any]] = []
         self.nav: list[dict[str, Any]] = []
+        self.book = RestingOrders()
+        # Carried to the *next bar*, which on a daily dataset is the next day.
         self.pending_targets: list[tuple[date, TargetPosition]] = []
         self.skipped_targets: list[dict[str, Any]] = []
         self._bars_seen = 0
@@ -97,19 +91,45 @@ class Scheduler:
             for underlying in self.config.data.underlyings
         }
 
+    def _bar_for(self, order: Order, bars: dict[str, Bar]) -> Bar:
+        bar = bars.get(order.symbol)
+        if bar is None:
+            raise BacktestDataError(
+                f"no bar for {order.symbol} on {order.trading_day}; cannot execute order"
+            )
+        return bar
+
+    def _execute(self, order: Order, bar: Bar) -> list[Fill]:
+        fills = self.matcher.execute(order, bar, self.account)
+        self.fills.extend(fills)
+        return fills
+
     def _submit(self, orders: list[Order], bars: dict[str, Bar]) -> list[Fill]:
         produced: list[Fill] = []
         for order in orders:
-            bar = bars.get(order.symbol)
-            if bar is None:
-                raise BacktestDataError(
-                    f"no bar for {order.symbol} on {order.trading_day}; cannot execute order"
-                )
+            bar = self._bar_for(order, bars)
             self.orders.append(order)
-            fills = self.matcher.execute(order, bar, self.account)
-            self.fills.extend(fills)
-            produced.extend(fills)
+            produced.extend(self._execute(order, bar))
         return produced
+
+    def _day_slots(self, day: date) -> list[tuple[datetime, dict[str, Bar]]]:
+        """The bars of ``day``, grouped into the instants the loop steps through.
+
+        A daily dataset gets a single slot built the way it always was, from each
+        contract's last bar of the day. Daily timestamps are labels rather than
+        instants, and contracts whose label differs must still be seen together.
+        """
+        if not self.dataset.intraday:
+            bars = self._day_bars(day)
+            if not bars:
+                return []
+            return [(max(bar.timestamp for bar in bars.values()), bars)]
+        slots = []
+        for stamp in self.dataset.timestamps_of_day(day):
+            bars = self.dataset.bars_at(stamp)
+            if bars:
+                slots.append((stamp.to_pydatetime(), bars))
+        return slots
 
     def _record_event(self, kind: EventKind, day: date, **payload: Any) -> None:
         self.events.append({"trading_day": day, "kind": kind.value, **payload})
@@ -126,6 +146,8 @@ class Scheduler:
         for underlying in self.config.data.underlyings:
             if not self.router.is_roll_day(underlying, day):
                 continue
+            # Whatever is working belongs to the contract being left behind.
+            self._cancel(self.book.cancel(underlying), day, "cancelled_on_roll")
             from_symbol = self.router.previous_trading_symbol(underlying, day)
             to_symbol = self.router.trading_symbol(underlying, day)
             net = self.account.symbol_net_lots(from_symbol) if from_symbol else 0
@@ -191,23 +213,85 @@ class Scheduler:
                 )
                 continue
             orders = self.router.signal_orders(target, day, timestamp, self.account, prices)
-            fills = self._submit(orders, bars)
-            # A day limit the bar never reached is simply cancelled at the close,
-            # so the signal is lost rather than carried. Record it: the share of
-            # signals a limit misses is the main cost of trading passively.
-            for fill in fills:
-                if fill.reject_reason != "limit_not_reached":
+            resting: list[Order] = []
+            for order in orders:
+                if order.limit_price is None:
+                    self._submit([order], bars)
                     continue
+                bar = self._bar_for(order, bars)
+                self.orders.append(order)
+                if self.matcher.limit_reached(order, bar) is not None:
+                    self._execute(order, bar)
+                else:
+                    resting.append(order)
+            self.book.place(signal_day, target, resting)
+
+    def _cross(self, bars: dict[str, Bar]) -> None:
+        """Trade the orders that were already working when this bar opened.
+
+        Several orders can come due on one bar, and they compete for the same free
+        margin, so they are filled in the order the assumed intrabar path reaches
+        their prices rather than in whatever order the book happens to hold them.
+        """
+        ready = []
+        for working, order in self.book.working():
+            bar = bars.get(order.symbol)
+            if bar is None:
+                continue
+            price = self.matcher.limit_reached(order, bar)
+            if price is not None:
+                ready.append((path_reach(bar, price), order.underlying, working, order, bar))
+        for _, _, working, order, bar in sorted(ready, key=lambda item: item[:2]):
+            self.book.fill(working.underlying, order)
+            # Re-stamp onto the bar that actually traded it: the order was written
+            # against the bar it was placed on, and the matcher reads the reference
+            # price and the trading day off the order.
+            traded = replace(
+                order,
+                timestamp=bar.timestamp,
+                trading_day=bar.trading_day,
+                reference_price=bar.open,
+            )
+            self._execute(traded, bar)
+
+    def _cancel(self, workings: list[Working], day: date, reason: str) -> None:
+        """Stop orders from working and record the signals they never delivered.
+
+        The share of signals a limit order misses is the main cost of trading
+        passively, so a cancelled order leaves the same paper trail as a rejection.
+        """
+        for working in workings:
+            for order in working.orders:
+                fill = self.matcher.cancel(order, reason)
+                self.fills.append(fill)
                 self.skipped_targets.append(
                     {
-                        "signal_day": signal_day,
+                        "signal_day": working.signal_day,
                         "execution_day": day,
-                        "underlying": target.underlying,
-                        "net_lots": target.net_lots,
-                        "reason": "limit_not_reached",
+                        "underlying": working.target.underlying,
+                        "net_lots": working.target.net_lots,
+                        "reason": reason,
                         "limit_price": fill.price,
                     }
                 )
+
+    def _place(self, day: date, targets: list[TargetPosition], last: bool) -> None:
+        """Route fresh targets to the next bar, leaving unchanged ones working.
+
+        A position-target strategy re-emits the same target on every bar. Taking
+        that as a new instruction would cancel and re-place the order every bar,
+        which would make the fill rate a function of the bar period. On the last
+        bar of the day nothing survives the close anyway, so every target is
+        carried instead.
+        """
+        carried: list[tuple[date, TargetPosition]] = []
+        for target in targets:
+            if not last:
+                if self.book.holds(target):
+                    continue
+                self._cancel(self.book.cancel(target.underlying), day, "superseded")
+            carried.append((day, target))
+        self.pending_targets = carried
 
     def _decide(self, day: date, timestamp: datetime, bars: dict[str, Bar]) -> list[TargetPosition]:
         routing = self._routing(day)
@@ -278,41 +362,49 @@ class Scheduler:
     def run(self) -> None:
         self.dataset.dominant_coverage()
         for day in self.dataset.trading_days:
-            bars = self._day_bars(day)
-            if not bars:
-                continue
-            timestamp = max(bar.timestamp for bar in bars.values())
-            self.account.roll_today_into_yesterday()
-            self._bars_seen += 1
+            slots = self._day_slots(day)
+            for index, (timestamp, bars) in enumerate(slots):
+                first = index == 0
+                last = index == len(slots) - 1
+                open_prices = self._prices(bars, "open")
+                close_prices = self._prices(bars, "close")
 
-            open_prices = self._prices(bars, "open")
-            close_prices = self._prices(bars, "close")
+                if first:
+                    self.account.roll_today_into_yesterday()
+                    if self.config.routing.roll_timing == "next_open":
+                        self._roll(day, timestamp, bars, open_prices)
+                    for underlying in self.config.data.underlyings:
+                        self._submit(
+                            self.router.expiry_orders(
+                                underlying, day, timestamp, self.account, open_prices
+                            ),
+                            bars,
+                        )
+                self._bars_seen += 1
 
-            if self.config.routing.roll_timing == "next_open":
-                self._roll(day, timestamp, bars, open_prices)
-            for underlying in self.config.data.underlyings:
-                self._submit(
-                    self.router.expiry_orders(
-                        underlying, day, timestamp, self.account, open_prices
-                    ),
-                    bars,
-                )
-            carried, self.pending_targets = self.pending_targets, []
-            self._apply_targets(carried, day, timestamp, bars, open_prices)
+                self._cross(bars)
+                carried, self.pending_targets = self.pending_targets, []
+                self._apply_targets(carried, day, timestamp, bars, open_prices)
 
-            self._record_event(EventKind.BAR, day, symbols=sorted(bars))
-            targets = self._decide(day, timestamp, bars)
-            if self.config.routing.roll_timing == "same_close":
-                self._roll(day, timestamp, bars, close_prices)
-            if targets:
-                if self.config.execution.market_fill == "same_close":
-                    self._apply_targets(
-                        [(day, target) for target in targets], day, timestamp, bars, close_prices
-                    )
-                else:
-                    self.pending_targets = [(day, target) for target in targets]
+                self._record_event(EventKind.BAR, day, symbols=sorted(bars))
+                targets = self._decide(day, timestamp, bars)
+                if last and self.config.routing.roll_timing == "same_close":
+                    self._roll(day, timestamp, bars, close_prices)
+                if targets:
+                    if self.config.execution.market_fill == "same_close":
+                        self._apply_targets(
+                            [(day, target) for target in targets],
+                            day,
+                            timestamp,
+                            bars,
+                            close_prices,
+                        )
+                    else:
+                        self._place(day, targets, last)
 
-            self._settle(day)
+                if last:
+                    self._cancel(self.book.cancel_all(), day, "limit_not_reached")
+                    self._settle(day)
 
     # -- frames -----------------------------------------------------------
 
@@ -383,7 +475,6 @@ def validate_config(
     config: BacktestConfig, data_adapter: DataAdapter | None = None
 ) -> dict[str, Any]:
     """Load and check data without trading, mirroring the ``validate`` command."""
-    check_supported(config)
     dataset = build_dataset(config.data, data_adapter)
     dataset.dominant_coverage()
     router = Router(dataset, config.routing)

@@ -4,6 +4,7 @@ import bisect
 from datetime import date, datetime
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .adapter import cross_validate, load_tables
@@ -110,6 +111,8 @@ class MarketDataset:
 
         self._bar_by_key: dict[tuple[str, pd.Timestamp], Bar] = {}
         self._bars_by_symbol_day: dict[tuple[str, date], list[Bar]] = {}
+        self._bars_by_timestamp: dict[pd.Timestamp, dict[str, Bar]] = {}
+        self._timestamps_by_day: dict[date, list[pd.Timestamp]] = {}
         for row in self.bars.itertuples(index=False):
             bar = Bar(
                 symbol=str(row.symbol),
@@ -133,14 +136,24 @@ class MarketDataset:
             )
             self._bar_by_key[(bar.symbol, row.datetime)] = bar
             self._bars_by_symbol_day.setdefault((bar.symbol, bar.trading_day), []).append(bar)
+            self._bars_by_timestamp.setdefault(row.datetime, {})[bar.symbol] = bar
+            slots = self._timestamps_by_day.setdefault(bar.trading_day, [])
+            if not slots or slots[-1] != row.datetime:
+                slots.append(row.datetime)
 
         self.trading_days: list[date] = sorted(set(self.bars["trading_day"]))
         self.timestamps: list[pd.Timestamp] = sorted(set(self.bars["datetime"]))
         self.bars_per_day = max(len(item) for item in self._bars_by_symbol_day.values())
-        if config.bar_freq == "1d" and self.bars_per_day > 1:
+        self.intraday = config.bar_freq != "1d"
+        if not self.intraday and self.bars_per_day > 1:
             raise BacktestDataError(
                 "data.bar_freq is 1d but some contract has several bars in one "
                 "trading day; set bar_freq to the real frequency of the source"
+            )
+        if self.intraday and self.bars_per_day == 1:
+            raise BacktestDataError(
+                f"data.bar_freq is {config.bar_freq} but no contract has more than one "
+                "bar in any trading day; the source looks daily, set bar_freq to 1d"
             )
 
         dominant = tables["dominant_map"]
@@ -162,6 +175,7 @@ class MarketDataset:
         self._charges = _fee_lookup(tables.get("charges"))
         self._margins = _fee_lookup(tables.get("margins"))
         self.settle_fallbacks = 0
+        self._slices: dict[tuple[str, str | None], tuple[pd.DataFrame, Any]] = {}
 
     # -- calendar ---------------------------------------------------------
 
@@ -178,6 +192,22 @@ class MarketDataset:
     def last_bar_of_day(self, symbol: str, day: date) -> Bar | None:
         bars = self._bars_by_symbol_day.get((symbol, day))
         return bars[-1] if bars else None
+
+    def timestamps_of_day(self, day: date) -> list[pd.Timestamp]:
+        """Every bar timestamp belonging to ``day``, in order.
+
+        A daily dataset yields exactly one entry per day, which is what collapses
+        the intraday loop back onto the original one-bar-per-day behaviour.
+        """
+        return self._timestamps_by_day.get(day, [])
+
+    def bars_at(self, timestamp: pd.Timestamp) -> dict[str, Bar]:
+        """Bars of every contract that traded at ``timestamp``.
+
+        Contracts without a bar at this instant are simply absent; the scheduler
+        treats them as untradable rather than reusing a stale price.
+        """
+        return dict(self._bars_by_timestamp.get(timestamp, {}))
 
     # -- routing inputs ---------------------------------------------------
 
@@ -240,6 +270,23 @@ class MarketDataset:
 
     # -- strategy-facing history -----------------------------------------
 
+    def _slice(self, underlying: str, symbol: str | None) -> tuple[pd.DataFrame, Any]:
+        """Cached rows for one underlying (optionally one contract), plus their times.
+
+        ``self.bars`` is already ordered by ``(datetime, symbol)``, so filtering
+        preserves that order and no re-sort is needed.
+        """
+        key = (underlying, symbol)
+        cached = self._slices.get(key)
+        if cached is None:
+            frame = self.bars[self.bars["underlying"] == underlying]
+            if symbol is not None:
+                frame = frame[frame["symbol"] == symbol]
+            frame = frame.reset_index(drop=True)
+            cached = (frame, frame["datetime"].to_numpy())
+            self._slices[key] = cached
+        return cached
+
     def history(
         self,
         underlying: str,
@@ -247,14 +294,16 @@ class MarketDataset:
         bars: int | None = None,
         symbol: str | None = None,
     ) -> pd.DataFrame:
-        frame = self.bars[self.bars["datetime"] <= pd.Timestamp(cutoff)]
-        frame = frame[frame["underlying"] == underlying]
-        if symbol is not None:
-            frame = frame[frame["symbol"] == symbol]
-        frame = frame.sort_values("datetime")
-        if bars is not None:
-            frame = frame.tail(bars)
-        return frame.reset_index(drop=True)
+        """Rows up to and including ``cutoff``; never anything later.
+
+        Binary search on a cached, pre-sorted slice: an intraday run asks this
+        once per bar, so scanning the whole table each time would make the
+        backtest quadratic in the number of bars.
+        """
+        frame, times = self._slice(underlying, symbol)
+        end = int(np.searchsorted(times, pd.Timestamp(cutoff).to_datetime64(), side="right"))
+        start = max(0, end - bars) if bars is not None else 0
+        return frame.iloc[start:end].reset_index(drop=True)
 
     def describe(self) -> dict[str, Any]:
         return {

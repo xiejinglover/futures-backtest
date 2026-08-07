@@ -18,9 +18,10 @@ class DataConfig(StrictModel):
     underlyings: list[str] = Field(min_length=1)
     start: date
     end: date
-    bar_freq: Literal["1d", "1m"] = "1d"
+    # Whatever period the source delivers; the engine never resamples. Anything
+    # other than 1d puts the scheduler on its intraday loop.
+    bar_freq: Literal["1d", "1m", "5m", "15m", "30m", "1h"] = "1d"
     data_version: str | None = None
-    history_bars: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def valid_dates(self) -> DataConfig:

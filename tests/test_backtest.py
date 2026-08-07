@@ -263,12 +263,13 @@ def test_validate_reports_the_roll_schedule_without_trading(tables):
     ]
 
 
-def test_intraday_frequency_is_refused_rather_than_sampled(tmp_path, tables):
+def test_an_intraday_frequency_over_daily_data_is_refused(tmp_path, tables):
+    """Claiming 1m over daily bars would silently make every day one decision."""
     config = config_for(tables, output_root=tmp_path)
     config.data.bar_freq = "1m"
-    with pytest.raises(BacktestDataError, match="not supported yet"):
+    with pytest.raises(BacktestDataError, match="looks daily"):
         run_backtest(config, DictAdapter(tables))
-    with pytest.raises(BacktestDataError, match="Phase 2"):
+    with pytest.raises(BacktestDataError, match="looks daily"):
         validate_config(config, DictAdapter(tables))
 
 

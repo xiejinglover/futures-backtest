@@ -23,6 +23,33 @@ def closing_direction(side: str) -> str:
     return "long" if side == "sell" else "short"
 
 
+def bar_path(bar: Bar) -> tuple[float, float, float, float]:
+    """The order in which a bar is assumed to have visited its four prices.
+
+    OHLC alone cannot say whether the high or the low came first, so this reads
+    the open's position: whichever extreme sits closer to the open is assumed to
+    have been reached first. It is a guess, and a shorter bar period is the only
+    real cure.
+    """
+    if bar.open - bar.low <= bar.high - bar.open:
+        return (bar.open, bar.low, bar.high, bar.close)
+    return (bar.open, bar.high, bar.low, bar.close)
+
+
+def path_reach(bar: Bar, price: float) -> int:
+    """Which leg of :func:`bar_path` first ran through ``price``.
+
+    Used to put several fills inside one bar into a plausible order, which
+    matters when they compete for the same free margin.
+    """
+    path = bar_path(bar)
+    for index in range(1, len(path)):
+        low, high = sorted((path[index - 1], path[index]))
+        if low - EPSILON <= price <= high + EPSILON:
+            return index
+    return len(path)
+
+
 class Matcher:
     """Bar-level fill simulation: tick grid, price limits, margin, and fees."""
 
@@ -46,7 +73,7 @@ class Matcher:
         if order.limit_price is None:
             price, slippage_ticks = self._fill_price(order.side, reference, info.tick_size, bar)
         else:
-            limit = self._align_limit(order.side, order.limit_price, info.tick_size)
+            limit = self.aligned_limit(order)
             reached = self._limit_fill_price(order.side, limit, bar)
             if reached is None:
                 return [self._reject(order, limit, "limit_not_reached")]
@@ -87,6 +114,34 @@ class Matcher:
                 self._fill(order, portion, price, commission, slippage_ticks, pnl, lots, offset)
             )
         return fills
+
+    def limit_reached(self, order: Order, bar: Bar) -> float | None:
+        """Fill price if a resting limit would trade on this bar, else ``None``.
+
+        A read-only probe, so the scheduler can test an order against every bar
+        of the day without minting a rejection record each time. Saying no here
+        leaves the order working: an untraded bar or a locked board is a reason
+        not to fill, not a reason to cancel.
+
+        The reference price is taken from this bar rather than from the bar the
+        order was placed on, matching what :meth:`execute` will be handed once
+        the answer is yes.
+        """
+        if order.limit_price is None or order.lots <= 0 or bar.volume <= 0:
+            return None
+        if self.config.enforce_price_limits:
+            if self._limit_locked(order.side, bar.open, bar) is not None:
+                return None
+        return self._limit_fill_price(order.side, self.aligned_limit(order), bar)
+
+    def aligned_limit(self, order: Order) -> float:
+        """The order's limit snapped onto the contract's tick grid."""
+        tick = self.dataset.contracts[order.symbol].tick_size
+        return self._align_limit(order.side, float(order.limit_price or 0.0), tick)
+
+    def cancel(self, order: Order, reason: str) -> Fill:
+        """A record for an order that stopped working without ever trading."""
+        return self._reject(order, self.aligned_limit(order), reason)
 
     # -- pricing ----------------------------------------------------------
 
