@@ -68,6 +68,10 @@ class ExecutionConfig(StrictModel):
     # Daily bars hide queue position, so a limit that the day's extreme merely
     # touches usually would not have been filled. "penetrate" is the honest default.
     limit_fill_rule: Literal["touch", "penetrate"] = "penetrate"
+    # A broker refuses an order it cannot cover at submission. The check here is
+    # only an estimate at the limit price, and nothing is frozen, so a fill can
+    # still be short of margin if the market moves against the account first.
+    check_margin_on_submit: bool = True
 
 
 class StrategyConfig(StrictModel):

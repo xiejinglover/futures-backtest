@@ -201,6 +201,20 @@ def test_a_limit_the_next_bar_never_reaches_loses_the_signal(tmp_path, tables):
     assert result.metrics["final_equity"] == pytest.approx(result.metrics["initial_cash"])
 
 
+def test_a_limit_the_account_cannot_cover_is_refused_when_it_is_placed(tmp_path, tables):
+    """A broker refuses what it cannot cover rather than letting it work."""
+    result = _run(
+        tmp_path,
+        tables,
+        strategy="tests.support:LimitStrategy",
+        parameters={"offset_ticks": 2, "lots": 40},
+        initial_cash=50000,
+    )
+    fills = _frame(result, "fills")
+    assert (fills["reject_reason"] == "insufficient_margin").all()
+    assert set(_frame(result, "skipped_targets")["reason"]) == {"insufficient_margin"}
+
+
 def test_a_marketable_limit_fills_at_the_open_and_beats_the_market_order(tmp_path, tables):
     limited = _run(
         tmp_path / "limit",

@@ -139,6 +139,18 @@ class Matcher:
         tick = self.dataset.contracts[order.symbol].tick_size
         return self._align_limit(order.side, float(order.limit_price or 0.0), tick)
 
+    def submittable(self, order: Order, account: Account) -> bool:
+        """Whether the account could cover this order at its own limit price.
+
+        A broker refuses an order it cannot cover instead of letting it work and
+        refusing it on fill. Nothing is frozen here, so this only rules out orders
+        that were unaffordable from the moment they were written.
+        """
+        if not self.config.check_margin_on_submit or order.offset != "open":
+            return True
+        direction = "long" if order.side == "buy" else "short"
+        return self._openable_lots(order, account, direction, self.aligned_limit(order)) > 0
+
     def cancel(self, order: Order, reason: str) -> Fill:
         """A record for an order that stopped working without ever trading."""
         return self._reject(order, self.aligned_limit(order), reason)

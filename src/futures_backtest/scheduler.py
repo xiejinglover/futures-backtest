@@ -222,8 +222,10 @@ class Scheduler:
                 self.orders.append(order)
                 if self.matcher.limit_reached(order, bar) is not None:
                     self._execute(order, bar)
-                else:
+                elif self.matcher.submittable(order, self.account):
                     resting.append(order)
+                else:
+                    self._drop(signal_day, target, order, day, "insufficient_margin")
             self.book.place(signal_day, target, resting)
 
     def _cross(self, bars: dict[str, Bar]) -> None:
@@ -262,18 +264,28 @@ class Scheduler:
         """
         for working in workings:
             for order in working.orders:
-                fill = self.matcher.cancel(order, reason)
-                self.fills.append(fill)
-                self.skipped_targets.append(
-                    {
-                        "signal_day": working.signal_day,
-                        "execution_day": day,
-                        "underlying": working.target.underlying,
-                        "net_lots": working.target.net_lots,
-                        "reason": reason,
-                        "limit_price": fill.price,
-                    }
-                )
+                self._drop(working.signal_day, working.target, order, day, reason)
+
+    def _drop(
+        self,
+        signal_day: date,
+        target: TargetPosition,
+        order: Order,
+        day: date,
+        reason: str,
+    ) -> None:
+        fill = self.matcher.cancel(order, reason)
+        self.fills.append(fill)
+        self.skipped_targets.append(
+            {
+                "signal_day": signal_day,
+                "execution_day": day,
+                "underlying": target.underlying,
+                "net_lots": target.net_lots,
+                "reason": reason,
+                "limit_price": fill.price,
+            }
+        )
 
     def _place(self, day: date, targets: list[TargetPosition], last: bool) -> None:
         """Route fresh targets to the next bar, leaving unchanged ones working.
