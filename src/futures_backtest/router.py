@@ -166,6 +166,9 @@ class Router:
                     lots=lots,
                     reference_price=price_of[held_symbol],
                     reason="signal",
+                    limit_price=target.limit_price if held_symbol == symbol else None,
+                    stop_price=target.stop_price if held_symbol == symbol else None,
+                    time_in_force=target.time_in_force,
                 )
             )
             remaining -= lots
@@ -182,6 +185,8 @@ class Router:
                     reference_price=price_of[symbol],
                     reason="signal",
                     limit_price=target.limit_price,
+                    stop_price=target.stop_price,
+                    time_in_force=target.time_in_force,
                 )
             )
         return orders

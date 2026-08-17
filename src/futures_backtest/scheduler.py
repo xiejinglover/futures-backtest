@@ -4,7 +4,7 @@ import json
 import os
 import platform
 import sys
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -31,6 +31,13 @@ from .types import (
     RollLog,
     TargetPosition,
 )
+
+
+@dataclass(frozen=True)
+class PendingTarget:
+    signal_day: date
+    target: TargetPosition
+    expires_on: date | None
 
 
 class Scheduler:
@@ -71,10 +78,12 @@ class Scheduler:
         self.ledger = TradeLedger(
             {symbol: info.multiplier for symbol, info in dataset.contracts.items()}
         )
-        # Carried to the *next bar*, which on a daily dataset is the next day.
-        self.pending_targets: list[tuple[date, TargetPosition]] = []
+        # Carried to the next bar of each underlying, not the next global slot.
+        self.pending_targets: dict[str, PendingTarget] = {}
+        self.pending_rolls: set[str] = set()
         self.skipped_targets: list[dict[str, Any]] = []
         self._bars_seen = 0
+        self._order_sequence = 0
 
     # -- helpers ----------------------------------------------------------
 
@@ -110,9 +119,16 @@ class Scheduler:
             self.ledger.record(fill)
         return fills
 
+    def _stamp_order(self, order: Order) -> Order:
+        if order.order_id:
+            return order
+        self._order_sequence += 1
+        return replace(order, order_id=f"O{self._order_sequence:09d}")
+
     def _submit(self, orders: list[Order], bars: dict[str, Bar]) -> list[Fill]:
         produced: list[Fill] = []
-        for order in orders:
+        for raw in orders:
+            order = self._stamp_order(raw)
             bar = self._bar_for(order, bars)
             self.orders.append(order)
             produced.extend(self._execute(order, bar))
@@ -148,8 +164,12 @@ class Scheduler:
         timestamp: datetime,
         bars: dict[str, Bar],
         prices: dict[str, float],
+        only_underlying: str | None = None,
     ) -> None:
-        for underlying in self.config.data.underlyings:
+        underlyings = (
+            [only_underlying] if only_underlying is not None else self.config.data.underlyings
+        )
+        for underlying in underlyings:
             if not self.router.is_roll_day(underlying, day):
                 continue
             # Whatever is working belongs to the contract being left behind.
@@ -196,15 +216,39 @@ class Scheduler:
                 )
             )
 
-    def _apply_targets(
+    def _try_rolls(
         self,
-        targets: list[tuple[date, TargetPosition]],
         day: date,
         timestamp: datetime,
         bars: dict[str, Bar],
         prices: dict[str, float],
     ) -> None:
-        for signal_day, target in targets:
+        """Execute each roll at its first slot with both contracts quoted."""
+        for underlying in sorted(self.pending_rolls):
+            old_symbol = self.router.previous_trading_symbol(underlying, day)
+            new_symbol = self.router.trading_symbol(underlying, day)
+            net = self.account.symbol_net_lots(old_symbol) if old_symbol else 0
+            if net and (old_symbol not in bars or new_symbol not in bars):
+                continue
+            self._roll(
+                day,
+                timestamp,
+                bars,
+                prices,
+                only_underlying=underlying,
+            )
+            self.pending_rolls.remove(underlying)
+
+    def _apply_targets(
+        self,
+        targets: list[PendingTarget],
+        day: date,
+        timestamp: datetime,
+        bars: dict[str, Bar],
+        prices: dict[str, float],
+    ) -> None:
+        for pending in targets:
+            signal_day, target = pending.signal_day, pending.target
             if self.router.is_roll_day(target.underlying, day) and not (
                 self.config.routing.allow_signals_on_roll_day
             ):
@@ -218,21 +262,67 @@ class Scheduler:
                     }
                 )
                 continue
+            routed = self.router.trading_symbol(target.underlying, day)
+            if routed not in prices:
+                self.pending_targets[target.underlying] = pending
+                continue
             orders = self.router.signal_orders(target, day, timestamp, self.account, prices)
             resting: list[Order] = []
-            for order in orders:
-                if order.limit_price is None:
+            for raw in orders:
+                order = self._stamp_order(raw)
+                if order.limit_price is None and order.stop_price is None:
                     self._submit([order], bars)
                     continue
                 bar = self._bar_for(order, bars)
                 self.orders.append(order)
-                if self.matcher.limit_reached(order, bar) is not None:
-                    self._execute(order, bar)
-                elif self.matcher.submittable(order, self.account):
-                    resting.append(order)
-                else:
+                if not self.matcher.submittable(order, self.account):
                     self._drop(signal_day, target, order, day, "insufficient_margin")
-            self.book.place(signal_day, target, resting)
+                    continue
+                ready, triggered = self.matcher.working_reached(order, bar)
+                if triggered and order.stop_price is not None:
+                    self._record_event(
+                        EventKind.ORDER_TRIGGER,
+                        day,
+                        timestamp=bar.timestamp,
+                        order_id=order.order_id,
+                        underlying=order.underlying,
+                        symbol=order.symbol,
+                        stop_price=order.stop_price,
+                    )
+                if ready:
+                    fills = self.matcher.execute(order, bar, self.account)
+                    self.fills.extend(fills)
+                    for fill in fills:
+                        self.ledger.record(fill)
+                    filled = sum(fill.filled_lots for fill in fills)
+                    if 0 < filled < order.lots:
+                        resting.append(replace(order, lots=order.lots - filled))
+                    elif filled == 0 and all(
+                        fill.reject_reason
+                        in ("no_liquidity", "no_volume", "limit_up", "limit_down")
+                        for fill in fills
+                    ):
+                        resting.append(order)
+                else:
+                    resting.append(order)
+            self.book.place(
+                signal_day,
+                target,
+                resting,
+                pending.expires_on,
+            )
+            if resting:
+                working = [
+                    state
+                    for item, state in self.book.working()
+                    if item.underlying == target.underlying
+                ]
+                for state in working:
+                    if state.order.stop_price is not None:
+                        _, triggered = self.matcher.working_reached(
+                            state.order, bars[state.order.symbol]
+                        )
+                        state.triggered = triggered
 
     def _cross(self, bars: dict[str, Bar]) -> None:
         """Trade the orders that were already working when this bar opened.
@@ -242,15 +332,44 @@ class Scheduler:
         their prices rather than in whatever order the book happens to hold them.
         """
         ready = []
-        for working, order in self.book.working():
+        for working, state in self.book.working():
+            order = state.order
             bar = bars.get(order.symbol)
             if bar is None:
                 continue
-            price = self.matcher.limit_reached(order, bar)
-            if price is not None:
-                ready.append((path_reach(bar, price), order.underlying, working, order, bar))
-        for _, _, working, order, bar in sorted(ready, key=lambda item: item[:2]):
-            self.book.fill(working.underlying, order)
+            was_triggered = state.triggered
+            can_fill, triggered = self.matcher.working_reached(
+                order, bar, stop_triggered=was_triggered
+            )
+            self.book.update_triggered(state, triggered)
+            if triggered and not was_triggered and order.stop_price is not None:
+                self._record_event(
+                    EventKind.ORDER_TRIGGER,
+                    bar.trading_day,
+                    timestamp=bar.timestamp,
+                    order_id=order.order_id,
+                    underlying=order.underlying,
+                    symbol=order.symbol,
+                    stop_price=order.stop_price,
+                )
+            if can_fill:
+                activation = (
+                    order.stop_price
+                    if order.stop_price is not None and not was_triggered
+                    else order.limit_price
+                )
+                ready.append(
+                    (
+                        path_reach(bar, float(activation or bar.open)),
+                        order.underlying,
+                        working,
+                        state,
+                        bar,
+                        was_triggered,
+                    )
+                )
+        for _, _, working, state, bar, was_triggered in sorted(ready, key=lambda item: item[:2]):
+            order = state.order
             # Re-stamp onto the bar that actually traded it: the order was written
             # against the bar it was placed on, and the matcher reads the reference
             # price and the trading day off the order.
@@ -260,7 +379,18 @@ class Scheduler:
                 trading_day=bar.trading_day,
                 reference_price=bar.open,
             )
-            self._execute(traded, bar)
+            fills = self.matcher.execute(traded, bar, self.account, stop_triggered=was_triggered)
+            self.fills.extend(fills)
+            for fill in fills:
+                self.ledger.record(fill)
+            filled = sum(fill.filled_lots for fill in fills)
+            if filled:
+                self.book.apply_fill(working.underlying, state, filled)
+            elif any(
+                fill.reject_reason not in ("no_liquidity", "no_volume", "limit_up", "limit_down")
+                for fill in fills
+            ):
+                self.book.apply_fill(working.underlying, state, order.lots)
 
     def _cancel(self, workings: list[Working], day: date, reason: str) -> None:
         """Stop orders from working and record the signals they never delivered.
@@ -289,11 +419,30 @@ class Scheduler:
                 "underlying": target.underlying,
                 "net_lots": target.net_lots,
                 "reason": reason,
-                "limit_price": fill.price,
+                "limit_price": order.limit_price,
+                "stop_price": order.stop_price,
+                "order_id": order.order_id,
             }
         )
 
-    def _place(self, day: date, targets: list[TargetPosition], last: bool) -> None:
+    def _next_trading_day(self, day: date) -> date | None:
+        try:
+            index = self.dataset.trading_days.index(day)
+        except ValueError:
+            return None
+        return (
+            self.dataset.trading_days[index + 1]
+            if index + 1 < len(self.dataset.trading_days)
+            else None
+        )
+
+    def _place(
+        self,
+        day: date,
+        timestamp: datetime,
+        targets: list[TargetPosition],
+        last: bool,
+    ) -> None:
         """Route fresh targets to the next bar, leaving unchanged ones working.
 
         A position-target strategy re-emits the same target on every bar. Taking
@@ -302,21 +451,77 @@ class Scheduler:
         bar of the day nothing survives the close anyway, so every target is
         carried instead.
         """
-        carried: list[tuple[date, TargetPosition]] = []
         for target in targets:
-            if not last:
-                if self.book.holds(target):
-                    continue
+            symbol = self.router.trading_symbol(target.underlying, day)
+            own_last_bar = self.dataset.last_bar_of_day(symbol, day)
+            at_or_after_own_close = last or (
+                own_last_bar is not None and timestamp >= own_last_bar.timestamp
+            )
+            if (
+                target.limit_price is None
+                and target.stop_price is None
+                and self.account.net_lots(target.underlying) == target.net_lots
+            ):
+                self.pending_targets.pop(target.underlying, None)
+                if not at_or_after_own_close:
+                    self._cancel(self.book.cancel(target.underlying), day, "superseded")
+                continue
+            existing = self.pending_targets.get(target.underlying)
+            if existing is not None and existing.target == target:
+                continue
+            holds = self.book.holds(target)
+            if holds and (not at_or_after_own_close or target.time_in_force == "GTC"):
+                continue
+            if not holds and not at_or_after_own_close:
                 self._cancel(self.book.cancel(target.underlying), day, "superseded")
-            carried.append((day, target))
-        self.pending_targets = carried
+            expires_on = None
+            if target.time_in_force == "DAY":
+                expires_on = self._next_trading_day(day) if at_or_after_own_close else day
+                if at_or_after_own_close and expires_on is None:
+                    continue
+            self.pending_targets[target.underlying] = PendingTarget(
+                signal_day=day,
+                target=target,
+                expires_on=expires_on,
+            )
+
+    def _apply_pending(
+        self,
+        day: date,
+        timestamp: datetime,
+        bars: dict[str, Bar],
+        prices: dict[str, float],
+    ) -> None:
+        due: list[PendingTarget] = []
+        for underlying, pending in list(self.pending_targets.items()):
+            if underlying in self.pending_rolls:
+                continue
+            symbol = self.router.trading_symbol(underlying, day)
+            if symbol not in bars:
+                continue
+            due.append(pending)
+            del self.pending_targets[underlying]
+        self._apply_targets(due, day, timestamp, bars, prices)
+
+    def _expire_pending(self, day: date) -> None:
+        for underlying, pending in list(self.pending_targets.items()):
+            if pending.expires_on is None or pending.expires_on > day:
+                continue
+            self.skipped_targets.append(
+                {
+                    "signal_day": pending.signal_day,
+                    "execution_day": day,
+                    "underlying": underlying,
+                    "net_lots": pending.target.net_lots,
+                    "reason": "day_expired",
+                }
+            )
+            del self.pending_targets[underlying]
 
     def _decide(self, day: date, timestamp: datetime, bars: dict[str, Bar]) -> list[TargetPosition]:
         routing = self._routing(day)
         visible = {
-            underlying: bars[symbol]
-            for underlying, symbol in routing.items()
-            if symbol in bars
+            underlying: bars[symbol] for underlying, symbol in routing.items() if symbol in bars
         }
         context = StrategyContext(
             trading_day=day,
@@ -336,13 +541,13 @@ class Scheduler:
         result = self.strategy.on_bar(context)
         targets = normalize_targets(result, tuple(self.config.data.underlyings))
         if self.config.execution.market_fill == "same_close" and any(
-            target.limit_price is not None for target in targets
+            target.limit_price is not None or target.stop_price is not None for target in targets
         ):
             raise BacktestDataError(
-                "a limit price cannot be combined with execution.market_fill="
+                "a limit or stop price cannot be combined with execution.market_fill="
                 "'same_close': the decision is taken at the close of the very bar "
                 "that would have to prove the fill, so any resting fill would be "
-                "look-ahead. Use market_fill='next_open' for limit orders"
+                "look-ahead. Use market_fill='next_open' for conditional orders"
             )
         return targets
 
@@ -390,7 +595,12 @@ class Scheduler:
                 if first:
                     self.account.roll_today_into_yesterday()
                     if self.config.routing.roll_timing == "next_open":
-                        self._roll(day, timestamp, bars, open_prices)
+                        self.pending_rolls.update(
+                            underlying
+                            for underlying in self.config.data.underlyings
+                            if self.router.is_roll_day(underlying, day)
+                        )
+                    self._try_rolls(day, timestamp, bars, open_prices)
                     for underlying in self.config.data.underlyings:
                         self._submit(
                             self.router.expiry_orders(
@@ -400,9 +610,10 @@ class Scheduler:
                         )
                 self._bars_seen += 1
 
+                if self.pending_rolls:
+                    self._try_rolls(day, timestamp, bars, open_prices)
                 self._cross(bars)
-                carried, self.pending_targets = self.pending_targets, []
-                self._apply_targets(carried, day, timestamp, bars, open_prices)
+                self._apply_pending(day, timestamp, bars, open_prices)
 
                 self._record_event(EventKind.BAR, day, symbols=sorted(bars))
                 targets = self._decide(day, timestamp, bars)
@@ -411,18 +622,51 @@ class Scheduler:
                 if targets:
                     if self.config.execution.market_fill == "same_close":
                         self._apply_targets(
-                            [(day, target) for target in targets],
+                            [
+                                PendingTarget(
+                                    signal_day=day,
+                                    target=target,
+                                    expires_on=day,
+                                )
+                                for target in targets
+                            ],
                             day,
                             timestamp,
                             bars,
                             close_prices,
                         )
                     else:
-                        self._place(day, targets, last)
+                        self._place(day, timestamp, targets, last)
 
                 if last:
-                    self._cancel(self.book.cancel_all(), day, "limit_not_reached")
+                    self._cancel(self.book.cancel_expired(day), day, "limit_not_reached")
+                    self._expire_pending(day)
+                    if self.pending_rolls:
+                        details = []
+                        for underlying in sorted(self.pending_rolls):
+                            details.append(
+                                f"{underlying}:"
+                                f"{self.router.previous_trading_symbol(underlying, day)}->"
+                                f"{self.router.trading_symbol(underlying, day)}"
+                            )
+                        raise BacktestDataError(
+                            f"cannot roll on {day}: no time slot had tradable bars for "
+                            + ", ".join(details)
+                        )
                     self._settle(day)
+        final_day = self.dataset.trading_days[-1]
+        self._cancel(self.book.cancel_all(), final_day, "end_of_backtest")
+        for underlying, pending in list(self.pending_targets.items()):
+            self.skipped_targets.append(
+                {
+                    "signal_day": pending.signal_day,
+                    "execution_day": final_day,
+                    "underlying": underlying,
+                    "net_lots": pending.target.net_lots,
+                    "reason": "end_of_backtest",
+                }
+            )
+        self.pending_targets.clear()
 
     # -- frames -----------------------------------------------------------
 

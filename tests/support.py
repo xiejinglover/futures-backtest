@@ -85,9 +85,7 @@ def two_contract_tables(
     """One underlying, two contracts, and one dominant switch on ``switch_day``."""
     near_closes = near_closes or [3500 + 10 * index for index in range(len(days))]
     far_closes = far_closes or [3560 + 10 * index for index in range(len(days))]
-    bars = bar_rows("RB2405", "RB", days, near_closes) + bar_rows(
-        "RB2410", "RB", days, far_closes
-    )
+    bars = bar_rows("RB2405", "RB", days, near_closes) + bar_rows("RB2410", "RB", days, far_closes)
     contracts = pd.DataFrame(
         [
             {
@@ -292,9 +290,7 @@ class FlipStrategy:
         from futures_backtest import TargetPosition
 
         lots = int(self.parameters.get("lots", 1))
-        return TargetPosition(
-            underlying="RB", net_lots=lots if context.bars_seen % 2 else -lots
-        )
+        return TargetPosition(underlying="RB", net_lots=lots if context.bars_seen % 2 else -lots)
 
 
 class LimitStrategy:
@@ -342,6 +338,24 @@ class FixedLimitStrategy:
         )
 
 
+class FixedStopStrategy:
+    """Keeps one fixed conditional target working for lifecycle tests."""
+
+    def __init__(self, parameters: dict[str, Any] | None = None):
+        self.parameters = dict(parameters or {})
+
+    def on_bar(self, context):  # noqa: ANN001
+        from futures_backtest import TargetPosition
+
+        return TargetPosition(
+            underlying="RB",
+            net_lots=int(self.parameters.get("lots", 1)),
+            limit_price=self.parameters.get("limit_price"),
+            stop_price=float(self.parameters["stop_price"]),
+            time_in_force=str(self.parameters.get("time_in_force", "DAY")),
+        )
+
+
 class IntradayTurnStrategy:
     """Opens at one slot of the trading day and flattens at another, every day."""
 
@@ -370,6 +384,22 @@ class StrayStrategy:
         from futures_backtest import TargetPosition
 
         return TargetPosition(underlying="CU", net_lots=1)
+
+
+class TargetAgOnceStrategy:
+    """Submit an AG target from a global slot where only RB has a bar."""
+
+    def __init__(self, parameters: dict[str, Any] | None = None):
+        self.parameters = dict(parameters or {})
+        self.sent = False
+
+    def on_bar(self, context):  # noqa: ANN001
+        from futures_backtest import TargetPosition
+
+        if self.sent:
+            return None
+        self.sent = True
+        return TargetPosition(underlying="AG", net_lots=1)
 
 
 class PeekingStrategy:

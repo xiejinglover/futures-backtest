@@ -57,7 +57,14 @@ class Matcher:
         self.dataset = dataset
         self.config = config
 
-    def execute(self, order: Order, bar: Bar, account: Account) -> list[Fill]:
+    def execute(
+        self,
+        order: Order,
+        bar: Bar,
+        account: Account,
+        *,
+        stop_triggered: bool = False,
+    ) -> list[Fill]:
         info = self.dataset.contracts[order.symbol]
         reference = order.reference_price
 
@@ -65,12 +72,14 @@ class Matcher:
             return [self._reject(order, reference, "non_positive_lots")]
         if bar.volume <= 0:
             return [self._reject(order, reference, "no_volume")]
-        if self.config.enforce_price_limits:
-            locked = self._limit_locked(order.side, reference, bar)
-            if locked is not None:
-                return [self._reject(order, reference, locked)]
 
-        if order.limit_price is None:
+        if order.stop_price is not None:
+            stop_fill = self._stop_fill_price(order, bar, stop_triggered)
+            if stop_fill is None:
+                return [self._reject(order, order.stop_price, "stop_not_reached")]
+            price, slippage_ticks = stop_fill
+            reference = price
+        elif order.limit_price is None:
             price, slippage_ticks = self._fill_price(order.side, reference, info.tick_size, bar)
         else:
             limit = self.aligned_limit(order)
@@ -81,6 +90,11 @@ class Matcher:
             # or a better one on a gap. Reporting the gap gain as slippage would
             # feed a negative cost into the roll cost aggregation.
             price, slippage_ticks = self._clamp_to_limits(reached, bar), 0.0
+
+        if self.config.enforce_price_limits:
+            locked = self._limit_locked(order.side, reference, bar)
+            if locked is not None:
+                return [self._reject(order, price, locked)]
 
         capacity = self._capacity(order, bar)
         if capacity <= 0:
@@ -138,6 +152,41 @@ class Matcher:
                 return None
         return self._limit_fill_price(order.side, self.aligned_limit(order), bar)
 
+    def working_reached(
+        self, order: Order, bar: Bar, *, stop_triggered: bool = False
+    ) -> tuple[bool, bool]:
+        """Whether a working order can trade now and its updated trigger state.
+
+        Trigger state advances even on a bar that cannot trade because it has no
+        volume or is price-limit locked. A triggered stop then waits as a market or
+        limit order for the next tradable bar instead of forgetting the condition.
+        """
+        triggered = stop_triggered
+        trigger: tuple[float, int] | None = None
+        if order.stop_price is not None and not triggered:
+            trigger = self._stop_trigger(order.side, float(order.stop_price), bar)
+            if trigger is None:
+                return False, False
+            triggered = True
+
+        if bar.volume <= 0:
+            return False, triggered
+        reference = trigger[0] if trigger is not None else bar.open
+        if self.config.enforce_price_limits:
+            if self._limit_locked(order.side, reference, bar) is not None:
+                return False, triggered
+
+        if order.stop_price is None:
+            if order.limit_price is None:
+                return True, triggered
+            return self.limit_reached(order, bar) is not None, triggered
+        if order.limit_price is None:
+            return triggered, triggered
+        if stop_triggered:
+            return self.limit_reached(order, bar) is not None, True
+        assert trigger is not None
+        return self._stop_limit_fill_price(order, bar, *trigger) is not None, True
+
     def aligned_limit(self, order: Order) -> float:
         """The order's limit snapped onto the contract's tick grid."""
         tick = self.dataset.contracts[order.symbol].tick_size
@@ -157,7 +206,13 @@ class Matcher:
 
     def cancel(self, order: Order, reason: str) -> Fill:
         """A record for an order that stopped working without ever trading."""
-        return self._reject(order, self.aligned_limit(order), reason)
+        if order.limit_price is not None:
+            price = self.aligned_limit(order)
+        elif order.stop_price is not None:
+            price = float(order.stop_price)
+        else:
+            price = order.reference_price
+        return self._reject(order, price, reason)
 
     # -- pricing ----------------------------------------------------------
 
@@ -183,6 +238,65 @@ class Matcher:
         # where closing on the extreme is common.
         price = min(max(price, bar.low), bar.high)
         return price, abs(price - reference) / tick
+
+    def _stop_trigger(self, side: str, stop: float, bar: Bar) -> tuple[float, int] | None:
+        """Return trigger reference and path leg, with gaps triggering at the open."""
+        if side == "buy":
+            if bar.open >= stop - EPSILON:
+                return bar.open, 0
+            if bar.high >= stop - EPSILON:
+                return stop, path_reach(bar, stop)
+            return None
+        if bar.open <= stop + EPSILON:
+            return bar.open, 0
+        if bar.low <= stop + EPSILON:
+            return stop, path_reach(bar, stop)
+        return None
+
+    def _stop_limit_fill_price(
+        self,
+        order: Order,
+        bar: Bar,
+        trigger_reference: float,
+        trigger_leg: int,
+    ) -> float | None:
+        """Fill a stop-limit only on the assumed path after its trigger."""
+        limit = self.aligned_limit(order)
+        touch = self.config.limit_fill_rule == "touch"
+        if order.side == "buy":
+            if trigger_reference <= limit + EPSILON:
+                return trigger_reference
+
+            def reached(value: float) -> bool:
+                return value <= limit + EPSILON if touch else value < limit - EPSILON
+        else:
+            if trigger_reference >= limit - EPSILON:
+                return trigger_reference
+
+            def reached(value: float) -> bool:
+                return value >= limit - EPSILON if touch else value > limit + EPSILON
+
+        path = bar_path(bar)
+        return limit if any(reached(value) for value in path[trigger_leg:]) else None
+
+    def _stop_fill_price(
+        self, order: Order, bar: Bar, stop_triggered: bool
+    ) -> tuple[float, float] | None:
+        tick = self.dataset.contracts[order.symbol].tick_size
+        if stop_triggered:
+            if order.limit_price is not None:
+                reached = self._limit_fill_price(order.side, self.aligned_limit(order), bar)
+                return (reached, 0.0) if reached is not None else None
+            return self._fill_price(order.side, bar.open, tick, bar)
+
+        trigger = self._stop_trigger(order.side, float(order.stop_price or 0.0), bar)
+        if trigger is None:
+            return None
+        reference, leg = trigger
+        if order.limit_price is not None:
+            reached = self._stop_limit_fill_price(order, bar, reference, leg)
+            return (reached, 0.0) if reached is not None else None
+        return self._fill_price(order.side, reference, tick, bar)
 
     def _clamp_to_limits(self, price: float, bar: Bar) -> float:
         if bar.upper_limit is not None:
@@ -288,6 +402,7 @@ class Matcher:
             realized_pnl=realized_pnl,
             status="filled" if total_filled == order.lots else "partial",
             reason=order.reason,
+            order_id=order.order_id,
         )
 
     def _reject(self, order: Order, price: float, reason: str) -> Fill:
@@ -307,4 +422,5 @@ class Matcher:
             status="rejected",
             reason=order.reason,
             reject_reason=reason,
+            order_id=order.order_id,
         )

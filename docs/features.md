@@ -145,7 +145,7 @@ on_bar(ctx, bar_view):
 ### 5.5 时间与事件推进
 
 - 按时间顺序回放；
-- 至少支持：`BAR`、`ROLL`（换月）、`SETTLE`（日终结算）；
+- 支持：`BAR`、`ORDER_TRIGGER`（止损触发）、`ROLL`（换月）、`SETTLE`（日终结算）；
 - Phase 1 单品种单周期；Phase 2 多品种 / 多周期。
 
 #### 日内主循环（T+0 任意时点开平仓）
@@ -155,12 +155,13 @@ on_bar(ctx, bar_view):
 表示不动作；要节流请用 `context.bars_seen` 自理。每根 bar 的顺序是：
 
 1. 检验挂单簿，命中即成交；
-2. 上一根 bar 留下的市价目标按本 bar 开盘价成交；
+2. 该品种上一根 bar 留下的市价目标，在其下一根可用 bar 开盘成交；
 3. `on_bar` 决策；
 4. 目标变了才撤旧单重挂：市价单等下一根 bar，限价单进挂单簿。
 
-**当日首根 bar 额外做**：今仓滚入昨仓、`next_open` 换月、到期强平。
-**当日末根 bar 额外做**：`same_close` 换月、撤光挂单、日终结算。
+**当日首根 bar 额外做**：今仓滚入昨仓；`next_open` 移仓从此开始等待新旧合约同时有
+bar，并在首个满足条件的时间槽执行。**当日末根 bar 额外做**：`same_close` 换月、
+撤销 DAY 挂单、日终结算；GTC 挂单继续保留。
 
 日线数据每天只有一根 bar，首根即末根，上述顺序退化成原来的开盘段 / 收盘段 / 结算。
 结算仍是每交易日恰好一次，`nav.csv` 行数等于交易日数而非 bar 数。
@@ -182,7 +183,7 @@ on_bar(ctx, bar_view):
 - 平今/平昨费率差异（数据具备时）；
 - 整数手；保证金不足时拒单或缩手数（可配置并记日志）。
 
-#### 限价单语义（挂单簿，存续到收盘）
+#### 限价、止损与 TIF
 
 策略在 `TargetPosition.limit_price` 上给价即为限价单。单根 bar 的判定规则：买单在
 `open <= limit` 时按开盘价成交（跳空使挂单立即可成交，价格优势归交易者），否则要求
@@ -190,8 +191,14 @@ on_bar(ctx, bar_view):
 `touch` 触及即可；卖单对称。限价先对齐到 tick 网格，买单向下、卖单向上取整，保证
 对齐后不会比策略要求的更激进。成交的 `slippage_ticks` 记 0。
 
-**委托存续到当日收盘**，逐根 bar 用上述规则检验，由 [book.py](../src/futures_backtest/book.py)
-的挂单簿维护。这不是可有可无的：一天一根 bar 时"当日有效"和"当根 bar 有效"重合，
+`TargetPosition.stop_price` 单独设置时生成 stop-market，与 `limit_price` 同时设置时
+生成 stop-limit。买 stop 在开盘已越过触发价时以开盘为基准，否则以 stop 为基准；
+卖 stop 对称。stop-market 在基准价上施加不利方向滑点，stop-limit 触发后按限价规则
+继续等待，且只允许使用假定路径中触发之后的部分证明同 bar 成交。
+
+`time_in_force` 可取 `DAY`（默认）或 `GTC`。DAY 存续到有效交易日收盘，GTC 可跨日，
+均由 [book.py](../src/futures_backtest/book.py) 的挂单簿按具体合约维护。这不是可有可无的：
+一天一根 bar 时"当日有效"和"当根 bar 有效"重合，
 一天 240 根 bar 后二者解耦，若仍每根 bar 撤单就等于**一分钟有效单**，同一策略跑 1m
 和 5m 结果不同，且差异来自实现假设而非市场。相应地：
 
@@ -199,15 +206,15 @@ on_bar(ctx, bar_view):
   持仓目标型策略每根 bar 重发同一目标会把挂单每分钟撤一次重挂，退回一分钟有效单。
 - **目标变了撤旧重挂**：净手数或限价任一改变，先撤该品种在途单再挂新的，记
   `reason=superseded`。
-- **收盘撤光**：未成交的记 `reason=limit_not_reached`，信号作废不顺延；`same_close`
-  换月时会先撤掉旧合约上的在途单，记 `reason=cancelled_on_roll`。不支持跨日 GTC。
+- **按 TIF 到期**：DAY 未成交的记 `reason=limit_not_reached`；GTC 不在收盘撤销。
+  换月时绝对价格不可直接迁移到另一价格域，旧合约在途单记 `cancelled_on_roll`。
 - **挂单时即校验保证金**（`execution.check_margin_on_submit`，默认开）：覆盖不了的
   单在提交阶段就以 `insufficient_margin` 拒掉，不进挂单簿。保证金**不冻结**，价格
   大幅不利变动后成交时仍可能不足。
 
-限价只施加于路由到当前主力合约的信号单；换月、到期强平、旧合约残留清理属被迫流量，
-挂不上会制造裸敞口，一律市价。`limit_price` 与 `market_fill: same_close` 互斥并在
-运行期报错：决策发生在收盘，用同一根 bar 的盘中低点证明成交是未来函数。
+条件价格只施加于路由到当前主力合约的信号单；换月、到期强平、旧合约残留清理属被迫
+流量，一律市价。`limit_price` / `stop_price` 与 `market_fill: same_close` 互斥并在
+运行期报错：决策发生在收盘，用同一根 bar 的盘中极值证明成交是未来函数。
 
 一根 bar 的 OHLC 说不出高低点谁先发生。引擎按**距开盘价远近**推断：`open - low <=
 high - open` 时假设 开→低→高→收，否则 开→高→低→收。同一根 bar 上多笔委托按该顺序
@@ -231,7 +238,7 @@ high - open` 时假设 开→低→高→收，否则 开→高→低→收。�
 - **无排队模型**：参与率上限不表达排队位置，`penetrate` 仍是排队失败的粗糙代理。
 - **时段跳空**：bar 撮合在有交易时段划分的市场上误差最大，中国期货夜盘与日盘之间
   正是这种断点。
-- 不支持止损单（`stop_price`）与跨日 GTC，两者都需要显式的 TIF 字段。
+- stop/stop-limit 的触发与先后仍来自 OHLC 路径假设，不等价于 tick 或盘口回放。
 - `events.csv` 行数随 bar 数线性增长，1m 一年约 6 万行。
 
 ### 5.7 账户与绩效
@@ -253,6 +260,34 @@ high - open` 时假设 开→低→高→收，否则 开→高→低→收。�
 落在 `nav.csv` 的 `settlement_variation` 里；`trades.csv` 是**经济口径**，入场到
 出场全程。只有 `sum(realized_pnl) + sum(settlement_variation) - sum(commission)`
 才等于权益变化。
+
+#### 指标公式
+
+以 `nav.csv` 的逐交易日权益 `E[1..n]` 与日收益 `r[t] = E[t]/E[t-1] - 1`（共 n-1 个，
+首个交易日相对初始资金的那一段**不在** `r` 里）为基础，年化因子固定 252
+（`performance.py` 的 `TRADING_DAYS_PER_YEAR`），无风险利率取 0：
+
+| 字段 | 公式 | 说明 |
+|------|------|------|
+| `total_return` | `E[n] / initial_cash - 1` | 含首日相对初始资金那一段 |
+| `annualized_return` | `(1 + total_return) ** (252 / n) - 1` | **几何**复利；`n` = 交易日数 = `trading_days` |
+| `annualized_volatility` | `std(r, ddof=1) * sqrt(252)` | 样本标准差；收益不足 2 个记 0 |
+| `sharpe` | `mean(r) / std(r, ddof=1) * sqrt(252)` | **算术**日均；分母为 0 或收益不足 2 个记 0 |
+| `sortino` | `mean(r) / std(r[r<0], ddof=1) * sqrt(252)` | 分母只取负收益，且以**负收益自身的均值**为中心，不是相对目标收益的下行偏差 |
+| `max_drawdown` | `min(E / cummax(E) - 1)` | 负数 |
+| `win_rate` | 盈利平仓笔数 / 平仓笔数 | 见下，结算口径 |
+| `profit_factor` | 平仓毛盈利 / 平仓毛亏损 | 同上；无亏损平仓笔时为 `null` 而非 `inf` |
+
+**`sharpe` 不等于 `annualized_return / annualized_volatility`**，这是有意为之而非 bug：
+分子一个是跨 n 天复利的几何年化、一个是算术日均乘 252，样本数也不同（`annualized_return`
+覆盖 n 天，而 `r` 只有 n-1 个）。短样本上二者能差一个数量级，谁都不是谁的近似。
+`tests/test_performance.py` 有一条测试专门断言二者不相等，要"顺手修正"前先读它。
+
+**`win_rate` / `profit_factor` 用的是结算口径**：取 `fills.csv` 中 `filled_lots > 0`
+且 `offset` 为 `close` / `close_today` 的行，按其 `realized_pnl` 判正负——也就是上一小节
+那套被日终结算切过段的口径，一个经济意义上盈利的回合若跨日持仓，可能被切成两笔、其中
+一笔为负。要回合口径请看 `round_trips` / `round_trip_win_rate` / `average_holding_minutes`，
+它们来自 `trades.csv`。**同一次运行里 `win_rate` 与 `round_trip_win_rate` 不相等是正常的。**
 
 ### 5.8 配置与可复现性
 
@@ -302,7 +337,7 @@ high - open` 时假设 开→低→高→收，否则 开→高→低→收。�
 - 与实盘共享同一套信号接口 + Router；
 - 参数优化/走步；
 - 更精细撮合（盘口、部分成交）；
-- 止损单与跨日 GTC（需要显式 TIF 字段）。
+- ~~止损单与跨日 GTC~~（已提供 `stop_price` 与 `time_in_force`，仍是 bar 级近似）。
 
 ## 9. 验收标准（摘要）
 

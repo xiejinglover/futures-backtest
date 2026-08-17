@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 import pandas as pd
@@ -14,7 +15,14 @@ TIMESTAMP = datetime(2024, 4, 2, 15, 0)
 
 
 def _order(
-    day, side="buy", offset="open", lots=1, price=3500.0, symbol="RB2405", limit_price=None
+    day,
+    side="buy",
+    offset="open",
+    lots=1,
+    price=3500.0,
+    symbol="RB2405",
+    limit_price=None,
+    stop_price=None,
 ):
     return Order(
         trading_day=day,
@@ -27,6 +35,7 @@ def _order(
         reference_price=price,
         reason="signal",
         limit_price=limit_price,
+        stop_price=stop_price,
     )
 
 
@@ -339,3 +348,52 @@ def test_zero_lot_orders_are_rejected_rather_than_silently_dropped():
     bar = dataset.last_bar_of_day("RB2405", days[0])
     rejected = matcher.execute(_order(days[0], lots=0), bar, account)[0]
     assert rejected.reject_reason == "non_positive_lots"
+
+
+# -- stop orders ----------------------------------------------------------
+
+
+def test_a_buy_stop_gap_fills_from_the_open_plus_slippage():
+    days = trading_days(4)
+    dataset, account, _, matcher = _limit_parts(days)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+    order = _order(days[0], "buy", stop_price=3490.0)
+
+    ready, triggered = matcher.working_reached(order, bar)
+    assert (ready, triggered) == (True, True)
+    fill = matcher.execute(order, bar, account)[0]
+    assert fill.price == pytest.approx(bar.open + dataset.contracts["RB2405"].tick_size)
+
+
+def test_a_sell_stop_trades_at_the_trigger_minus_slippage_without_a_gap():
+    days = trading_days(4)
+    dataset, account, _, matcher = _limit_parts(days)
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+    matcher.execute(_order(days[0], "buy", price=bar.open), bar, account)
+    order = _order(
+        days[0],
+        "sell",
+        offset="close",
+        price=bar.open,
+        stop_price=3494.0,
+    )
+
+    ready, triggered = matcher.working_reached(order, bar)
+    assert (ready, triggered) == (True, True)
+    fill = matcher.execute(order, bar, account)[0]
+    assert fill.price == pytest.approx(3493.0)
+
+
+def test_a_stop_limit_can_trigger_then_wait_for_a_later_bar():
+    days = trading_days(4)
+    dataset, account, _, matcher = _limit_parts(days)
+    first = dataset.last_bar_of_day("RB2405", days[0])
+    order = _order(days[0], "buy", stop_price=3500.0, limit_price=3494.0)
+
+    ready, triggered = matcher.working_reached(order, first)
+    assert (ready, triggered) == (False, True)
+    later = replace(first, open=3495.0, high=3498.0, low=3493.0, close=3494.0)
+    ready, triggered = matcher.working_reached(order, later, stop_triggered=triggered)
+    assert (ready, triggered) == (True, True)
+    fill = matcher.execute(order, later, account, stop_triggered=True)[0]
+    assert fill.price == pytest.approx(3494.0)

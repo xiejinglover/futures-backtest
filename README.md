@@ -189,7 +189,7 @@ daily = context.history("RB", bars=20, symbol=context.trading_symbol("RB"), freq
 
 游标所在的那个周期按已走完的部分返回——盘中确实知道"今日至此的最高价"，不是未来函数。
 
-### 限价单
+### 限价单、止损单与 TIF
 
 策略在 `TargetPosition` 上给出 `limit_price` 即为限价单，不给就是市价单：
 
@@ -202,24 +202,37 @@ return TargetPosition(
 )
 ```
 
-委托**存续到当日收盘**，逐根 bar 检验：跳空开在限价之内按开盘价成交，否则看最高/
-最低价是否按 `limit_fill_rule` 达到限价。收盘仍未成交即撤单，信号作废并记入
-`skipped_targets.csv`（`reason=limit_not_reached`），不顺延到下一日，也不支持
-跨日 GTC。
+`stop_price` 单独使用是 stop-market，与 `limit_price` 同时使用是 stop-limit；
+`time_in_force` 可取 `DAY`（默认）或 `GTC`：
+
+```python
+return TargetPosition(
+    underlying="RB",
+    net_lots=0,
+    stop_price=3450,
+    time_in_force="GTC",
+)
+```
+
+DAY 委托存续到当日收盘，GTC 跨交易日保留。限价跳空开在限价之内按开盘价成交，否则看
+最高/最低价是否按 `limit_fill_rule` 达到限价。stop-market 跳空越过 stop 时按开盘价
+加滑点，否则按 stop 价加滑点；stop-limit 触发后继续作为限价单等待。订单按具体合约
+独立保存，其他品种的时间槽不会消费它。绝对价格的 GTC 委托不会自动换算到新合约，
+换月时以 `cancelled_on_roll` 撤销。
 
 目标没变就不重挂——否则持仓目标型策略每根 bar 重发同一目标会把挂单每分钟撤一次
 重挂，成交率就成了 bar 周期的函数而非市场的函数。目标变了会撤旧单重挂
 （`reason=superseded`），`same_close` 换月也会撤掉旧合约上的在途单
 （`reason=cancelled_on_roll`）。
 
-限价只作用于路由到当前主力合约的信号单，换月、到期强平以及旧合约上的残留清理单一律
-走市价。因为决策当天的 bar 不能同时用来证明成交，`limit_price` 与
-`execution.market_fill: same_close` 组合会直接报错。
+条件价格只作用于路由到当前主力合约的信号单，换月、到期强平以及旧合约上的残留清理单
+一律走市价。因为决策当天的 bar 不能同时用来证明成交，`limit_price` / `stop_price`
+与 `execution.market_fill: same_close` 组合会直接报错。
 
 ## 输出
 
 每次运行在 `output.root/<run_id>/` 下写：`orders.csv`、`fills.csv`、`rolls.csv`、
-`events.csv`（`BAR` / `ROLL` / `SETTLE`）、`nav.csv`、`skipped_targets.csv`、
+`events.csv`（`BAR` / `ORDER_TRIGGER` / `ROLL` / `SETTLE`）、`nav.csv`、`skipped_targets.csv`、
 `trades.csv`、`metrics.json`、`metadata.json`、`config.json`。
 
 `nav.csv` 的 `unrealized_pnl` 在日终通常为 0：结算把持仓成本重置为结算价，浮动盈亏
@@ -238,7 +251,7 @@ return TargetPosition(
 - 没有排队模型。`penetrate` 与 `volume_participation` 都只是排队失败与深度的粗糙
   代理，不表达排队位置。
 - 挂单时校验的保证金**不冻结**，价格大幅不利变动后成交时仍可能不足。
-- 不支持止损单与跨日 GTC，两者都需要显式的 TIF 字段。
+- stop 与 stop-limit 仍基于 OHLC 和假定的 bar 内路径，不是 tick/盘口级触发。
 - `events.csv` 行数随 bar 数线性增长，1m 一年约 6 万行。
 - 策略看到的是**被路由合约的真实 bar**。用于特征的复权连续序列（signal view）属于
   Phase 2，届时仍不参与撮合。

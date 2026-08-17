@@ -58,12 +58,32 @@ def test_signal_orders_open_on_the_routed_contract():
     days = trading_days(6)
     dataset, account, router, _ = make_parts(two_contract_tables(days, days[3]))
     prices = _prices(dataset, days[1])
-    orders = router.signal_orders(
-        TargetPosition("RB", 3), days[1], TIMESTAMP, account, prices
-    )
+    orders = router.signal_orders(TargetPosition("RB", 3), days[1], TIMESTAMP, account, prices)
     assert [(order.symbol, order.side, order.offset, order.lots) for order in orders] == [
         ("RB2405", "buy", "open", 3)
     ]
+
+
+def test_signal_orders_preserve_stop_limit_and_gtc_fields():
+    days = trading_days(6)
+    dataset, account, router, _ = make_parts(two_contract_tables(days, days[3]))
+    orders = router.signal_orders(
+        TargetPosition(
+            "RB",
+            3,
+            limit_price=3510,
+            stop_price=3500,
+            time_in_force="GTC",
+        ),
+        days[1],
+        TIMESTAMP,
+        account,
+        _prices(dataset, days[1]),
+    )
+    assert len(orders) == 1
+    assert orders[0].limit_price == 3510
+    assert orders[0].stop_price == 3500
+    assert orders[0].time_in_force == "GTC"
 
 
 def test_a_reversal_closes_before_it_opens():
@@ -186,9 +206,7 @@ def test_expiry_buffer_flattens_a_contract_near_its_last_trading_day():
     ):
         matcher.execute(order, bars[order.symbol], account)
 
-    orders = router.expiry_orders(
-        "RB", days[3], TIMESTAMP, account, _prices(dataset, days[3])
-    )
+    orders = router.expiry_orders("RB", days[3], TIMESTAMP, account, _prices(dataset, days[3]))
     assert [(order.symbol, order.offset, order.reason) for order in orders] == [
         ("RB2405", "close", "expiry")
     ]

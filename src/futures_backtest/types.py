@@ -16,6 +16,7 @@ class BacktestDataError(RuntimeError):
 
 class EventKind(StrEnum):
     BAR = "BAR"
+    ORDER_TRIGGER = "ORDER_TRIGGER"
     ROLL = "ROLL"
     SETTLE = "SETTLE"
 
@@ -53,25 +54,32 @@ class TargetPosition:
     Positive is long, negative is short, zero is flat. The strategy never names a
     month contract; the router resolves one.
 
-    ``limit_price`` turns the resulting order into a day limit order on the routed
-    contract. Leaving it ``None`` keeps the default market behaviour.
+    ``limit_price`` turns the resulting order into a limit order. ``stop_price``
+    makes it a stop-market order, or a stop-limit order when both prices are set.
+    ``time_in_force`` is ``DAY`` by default; ``GTC`` survives trading-day closes.
     """
 
     underlying: str
     net_lots: int
     limit_price: float | None = None
+    stop_price: float | None = None
+    time_in_force: str = "DAY"
 
     def __post_init__(self) -> None:
         if not self.underlying:
             raise ValueError("TargetPosition.underlying must not be empty")
         if int(self.net_lots) != self.net_lots:
             raise ValueError("TargetPosition.net_lots must be a whole number of lots")
-        if self.limit_price is not None:
-            if not math.isfinite(self.limit_price) or self.limit_price <= 0:
+        for name, price in (
+            ("limit_price", self.limit_price),
+            ("stop_price", self.stop_price),
+        ):
+            if price is not None and (not math.isfinite(price) or price <= 0):
                 raise ValueError(
-                    "TargetPosition.limit_price must be a positive finite price, "
-                    f"got {self.limit_price!r}"
+                    f"TargetPosition.{name} must be a positive finite price, got {price!r}"
                 )
+        if self.time_in_force not in ("DAY", "GTC"):
+            raise ValueError("TargetPosition.time_in_force must be 'DAY' or 'GTC'")
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,9 @@ class Order:
     reference_price: float
     reason: str  # "signal" | "roll_out" | "roll_in" | "expiry"
     limit_price: float | None = None  # None means market order
+    stop_price: float | None = None
+    time_in_force: str = "DAY"
+    order_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -105,6 +116,7 @@ class Fill:
     status: str  # "filled" | "partial" | "rejected"
     reason: str
     reject_reason: str | None = None
+    order_id: str = ""
 
 
 @dataclass

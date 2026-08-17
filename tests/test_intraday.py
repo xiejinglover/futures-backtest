@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from futures_backtest import run_backtest
+from futures_backtest import BacktestDataError, run_backtest
 from tests.support import DictAdapter, config_for, intraday_tables, make_dataset, trading_days
 
 
@@ -93,9 +93,7 @@ def test_a_resting_limit_fills_on_a_later_bar_of_the_same_day(tmp_path, tables):
     assert datetime.fromisoformat(first["timestamp"]).time().minute == 20
 
 
-def test_an_unchanged_target_leaves_its_order_working_instead_of_re_placing_it(
-    tmp_path, tables
-):
+def test_an_unchanged_target_leaves_its_order_working_instead_of_re_placing_it(tmp_path, tables):
     """Otherwise the fill rate would be a function of the bar period."""
     result = _run(
         tmp_path,
@@ -125,6 +123,23 @@ def test_a_changed_target_cancels_the_order_the_old_one_left_working(tmp_path, t
     assert "superseded" in set(skipped["reason"])
 
 
+def test_a_partial_fill_keeps_the_same_order_working_for_its_remainder(tmp_path, tables):
+    tables["bars"]["volume"] = 100
+    result = _run(
+        tmp_path,
+        tables,
+        strategy="tests.support:FixedLimitStrategy",
+        parameters={"limit_price": 4000.0, "lots": 3},
+        execution={"volume_participation": 0.01},
+    )
+    orders = _frame(result, "orders")
+    first_order = orders.iloc[0]["order_id"]
+    fills = _frame(result, "fills")
+    parts = fills[(fills["order_id"] == first_order) & (fills["filled_lots"] > 0)]
+    assert list(parts["filled_lots"]) == [1, 1, 1]
+    assert parts["filled_lots"].sum() == 3
+
+
 def test_a_roll_cancels_what_is_still_working_on_the_contract_it_leaves(tmp_path, tables):
     """A close-time roll is the one moment an order can outlive its contract."""
     result = _run(
@@ -136,6 +151,94 @@ def test_a_roll_cancels_what_is_still_working_on_the_contract_it_leaves(tmp_path
     )
     skipped = _frame(result, "skipped_targets")
     assert "cancelled_on_roll" in set(skipped["reason"])
+
+
+def test_a_gtc_stop_survives_the_close_and_fills_the_next_day(tmp_path, tables):
+    result = _run(
+        tmp_path,
+        tables,
+        strategy="tests.support:FixedStopStrategy",
+        parameters={"stop_price": 3520.0, "lots": 1, "time_in_force": "GTC"},
+    )
+    orders = _frame(result, "orders")
+    stop_orders = orders[orders["stop_price"].notna()]
+    assert len(stop_orders) == 1
+    fills = _frame(result, "fills")
+    stop_fill = fills[
+        (fills["order_id"] == stop_orders.iloc[0]["order_id"]) & (fills["filled_lots"] > 0)
+    ]
+    assert len(stop_fill) == 1
+    assert (
+        pd.to_datetime(stop_fill.iloc[0]["trading_day"]).date()
+        > pd.to_datetime(stop_orders.iloc[0]["trading_day"]).date()
+    )
+    events = _frame(result, "events")
+    triggers = events[events["kind"] == "ORDER_TRIGGER"]
+    assert list(triggers["order_id"].dropna()) == [stop_orders.iloc[0]["order_id"]]
+
+
+def test_a_market_target_waits_for_its_own_underlyings_next_bar(tmp_path, tables):
+    rb = tables["bars"]
+    ag_bars = rb[rb["symbol"] == "RB2405"].copy()
+    ag_bars["symbol"] = "AG2405"
+    ag_bars["underlying"] = "AG"
+    ag_bars["datetime"] = ag_bars["datetime"] + timedelta(minutes=7)
+    tables["bars"] = pd.concat([rb, ag_bars], ignore_index=True)
+
+    ag_contract = tables["contracts"].iloc[[0]].copy()
+    ag_contract["symbol"] = "AG2405"
+    ag_contract["underlying"] = "AG"
+    tables["contracts"] = pd.concat([tables["contracts"], ag_contract], ignore_index=True)
+    ag_dominant = tables["dominant_map"].drop_duplicates("trading_day").copy()
+    ag_dominant["underlying"] = "AG"
+    ag_dominant["dominant_symbol"] = "AG2405"
+    tables["dominant_map"] = pd.concat([tables["dominant_map"], ag_dominant], ignore_index=True)
+    ag_settles = tables["settles"][tables["settles"]["symbol"] == "RB2405"].copy()
+    ag_settles["symbol"] = "AG2405"
+    tables["settles"] = pd.concat([tables["settles"], ag_settles], ignore_index=True)
+
+    config = config_for(
+        tables,
+        strategy="tests.support:TargetAgOnceStrategy",
+        output_root=tmp_path,
+    )
+    config.data.bar_freq = "5m"
+    config.data.underlyings = ["RB", "AG"]
+    result = run_backtest(config, DictAdapter(tables))
+    fills = _frame(result, "fills")
+    ag_fill = fills[(fills["underlying"] == "AG") & (fills["filled_lots"] > 0)].iloc[0]
+    assert datetime.fromisoformat(ag_fill["timestamp"]).time().minute == 7
+
+
+def test_a_roll_waits_until_both_contracts_have_a_bar(tmp_path, tables):
+    days = sorted(set(tables["bars"]["trading_day"]))
+    roll_day = days[4]
+    first = min(tables["bars"].loc[tables["bars"]["trading_day"] == roll_day, "datetime"])
+    tables["bars"] = tables["bars"][
+        ~(
+            (tables["bars"]["symbol"] == "RB2405")
+            & (tables["bars"]["trading_day"] == roll_day)
+            & (tables["bars"]["datetime"] == first)
+        )
+    ]
+    result = _run(tmp_path, tables)
+    fills = _frame(result, "fills")
+    roll_fills = fills[
+        (fills["reason"].isin(["roll_out", "roll_in"]))
+        & (pd.to_datetime(fills["trading_day"]).dt.date == roll_day)
+    ]
+    assert len(roll_fills) == 2
+    assert {datetime.fromisoformat(value).time().minute for value in roll_fills["timestamp"]} == {5}
+
+
+def test_a_roll_fails_closed_when_no_slot_has_both_contracts(tmp_path, tables):
+    days = sorted(set(tables["bars"]["trading_day"]))
+    roll_day = days[4]
+    tables["bars"] = tables["bars"][
+        ~((tables["bars"]["symbol"] == "RB2405") & (tables["bars"]["trading_day"] == roll_day))
+    ]
+    with pytest.raises(BacktestDataError, match="no time slot had tradable bars"):
+        _run(tmp_path, tables)
 
 
 def test_history_is_cut_at_the_cursor_and_matches_a_plain_filter(tables):
@@ -183,13 +286,11 @@ def test_a_round_trip_is_reported_with_its_entry_exit_and_holding_time(tmp_path,
     first = trades.iloc[0]
     # Opened on the third bar, closed on the fifth, five minutes apart.
     assert first["holding_minutes"] == pytest.approx(10.0)
-    assert first["net_pnl"] == pytest.approx(
-        first["gross_pnl"] - first["commission"]
-    )
+    assert first["net_pnl"] == pytest.approx(first["gross_pnl"] - first["commission"])
     fills = _frame(result, "fills")
-    assert trades["lots"].sum() == fills[fills["offset"].str.startswith("close")][
-        "filled_lots"
-    ].sum()
+    assert (
+        trades["lots"].sum() == fills[fills["offset"].str.startswith("close")]["filled_lots"].sum()
+    )
     assert result.metrics["round_trips"] == len(trades)
 
 
@@ -216,8 +317,6 @@ def test_a_round_trip_held_overnight_does_not_match_the_fill_it_closed_on(tmp_pa
 
     nav = _frame(result, "nav")
     total = (
-        fills["realized_pnl"].sum()
-        + nav["settlement_variation"].sum()
-        - fills["commission"].sum()
+        fills["realized_pnl"].sum() + nav["settlement_variation"].sum() - fills["commission"].sum()
     )
     assert result.metrics["final_equity"] - result.metrics["initial_cash"] == pytest.approx(total)
