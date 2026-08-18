@@ -2,6 +2,8 @@
 
 ## 未发布
 
+## 0.2.0 - 2026-08-18
+
 - **盘中条件单**：`TargetPosition` 新增 `stop_price` 与 `time_in_force`，支持 bar 级
   stop-market / stop-limit 及 DAY / GTC；跳空按开盘触发，否则按 stop 触发并对
   stop-market 施加滑点。订单与成交输出新增稳定的 `order_id`。
