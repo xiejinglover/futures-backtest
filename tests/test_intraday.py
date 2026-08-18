@@ -274,6 +274,43 @@ def test_history_folds_into_daily_periods_and_the_running_day_keeps_updating(tab
     )
 
 
+def test_rolled_history_materializes_only_the_requested_tail(tables):
+    dataset = make_dataset(tables, bar_freq="5m")
+    days = sorted(set(tables["bars"]["trading_day"]))
+    cutoff = dataset.timestamps_of_day(days[-1])[-1]
+
+    whole = dataset.history("RB", cutoff, symbol="RB2405", freq="1d")
+    tail = dataset.history("RB", cutoff, bars=2, symbol="RB2405", freq="1d")
+
+    pd.testing.assert_frame_equal(tail, whole.tail(2).reset_index(drop=True))
+
+
+def test_rolled_history_can_rewind_without_leaking_future_data(tables):
+    dataset = make_dataset(tables, bar_freq="5m")
+    days = sorted(set(tables["bars"]["trading_day"]))
+    late = dataset.timestamps_of_day(days[-1])[-1]
+    early = dataset.timestamps_of_day(days[1])[2]
+
+    dataset.history("RB", late, bars=2, symbol="RB2405", freq="1d")
+    rewound = dataset.history("RB", early, bars=2, symbol="RB2405", freq="1d")
+    expected_raw = dataset.history("RB", early, symbol="RB2405")
+    expected = expected_raw.groupby("trading_day", sort=False).agg(
+        symbol=("symbol", "first"),
+        underlying=("underlying", "first"),
+        datetime=("datetime", "last"),
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        open_interest=("open_interest", "last"),
+    )
+    expected.insert(3, "trading_day", expected.index)
+    expected = expected.reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(rewound, expected, check_dtype=False)
+
+
 def test_a_round_trip_is_reported_with_its_entry_exit_and_holding_time(tmp_path, tables):
     result = _run(
         tmp_path,

@@ -45,38 +45,25 @@ def _period_keys(frame: pd.DataFrame, freq: str) -> Any:
 
 
 class _Rollup:
-    """Streaming OHLCV aggregation over a slice, folded once and reused.
-
-    Row order is by time, so a period's rows are contiguous and a period is
-    finished the moment a later one appears. Finished periods are folded away
-    for good; only the one the cursor sits inside is recomputed per call.
-    """
+    """Streaming OHLCV aggregation over a slice, folded once and reused."""
 
     def __init__(self, keys: Any):
         self.keys = keys
-        self.done = 0
+        self.end = 0
         self.order: list[tuple[str, Any]] = []
-        self.closed: dict[tuple[str, Any], dict[str, Any]] = {}
+        self.records: dict[tuple[str, Any], dict[str, Any]] = {}
 
-    def upto(self, frame: pd.DataFrame, end: int) -> pd.DataFrame:
-        if end <= 0:
+    def upto(self, frame: pd.DataFrame, end: int, bars: int | None = None) -> pd.DataFrame:
+        if end <= 0 or (bars is not None and bars <= 0):
             return pd.DataFrame(columns=list(_ROLLUP_COLUMNS))
-        if end < self.done:
-            self.done, self.order, self.closed = 0, [], {}
-        cut = end
-        while cut > 0 and self.keys[cut - 1] == self.keys[end - 1]:
-            cut -= 1
-        for index in range(self.done, cut):
-            _fold(self.closed, self.order, self.keys[index], frame.iloc[index])
-        self.done = max(self.done, cut)
+        if end < self.end:
+            self.end, self.order, self.records = 0, [], {}
+        for index in range(self.end, end):
+            _fold(self.records, self.order, self.keys[index], frame.iloc[index])
+        self.end = end
 
-        open_order = list(self.order)
-        overlay = dict(self.closed)
-        for index in range(cut, end):
-            _fold(overlay, open_order, self.keys[index], frame.iloc[index], copy_on_write=True)
-        return pd.DataFrame(
-            [overlay[key] for key in open_order], columns=list(_ROLLUP_COLUMNS)
-        )
+        keys = self.order[-bars:] if bars is not None else self.order
+        return pd.DataFrame([self.records[key] for key in keys], columns=list(_ROLLUP_COLUMNS))
 
 
 def _fold(
@@ -84,7 +71,6 @@ def _fold(
     order: list[tuple[str, Any]],
     period: Any,
     row: Any,
-    copy_on_write: bool = False,
 ) -> None:
     key = (str(row.symbol), period)
     slot = into.get(key)
@@ -103,9 +89,6 @@ def _fold(
         }
         order.append(key)
         return
-    if copy_on_write:
-        slot = dict(slot)
-        into[key] = slot
     slot["datetime"] = row.datetime
     slot["trading_day"] = row.trading_day
     slot["high"] = max(slot["high"], float(row.high))
@@ -408,16 +391,26 @@ class MarketDataset:
         frame, times = self._slice(underlying, symbol)
         end = int(np.searchsorted(times, pd.Timestamp(cutoff).to_datetime64(), side="right"))
         if freq is not None:
-            frame = self._rollup(underlying, symbol, freq, end)
-            end = len(frame)
+            return self._rollup(underlying, symbol, freq, end, bars)
         start = max(0, end - bars) if bars is not None else 0
-        return frame.iloc[start:end].reset_index(drop=True)
+        result = frame.iloc[start:end]
+        if start:
+            result = result.copy(deep=False)
+            result.index = pd.RangeIndex(len(result))
+        return result
 
-    def _rollup(self, underlying: str, symbol: str | None, freq: str, end: int) -> pd.DataFrame:
+    def _rollup(
+        self,
+        underlying: str,
+        symbol: str | None,
+        freq: str,
+        end: int,
+        bars: int | None = None,
+    ) -> pd.DataFrame:
         """Aggregate the first ``end`` rows of a slice into ``freq`` periods.
 
-        Periods are closed as the cursor passes them and never revisited, so a
-        call costs the number of periods rather than the number of bars.
+        Each source row is folded once as the cursor advances. When ``bars`` is
+        set, only that many aggregate rows are materialized for the caller.
         """
         if freq not in _PERIODS:
             raise BacktestDataError(
@@ -430,7 +423,7 @@ class MarketDataset:
         if state is None:
             state = _Rollup(_period_keys(frame, freq))
             self._rollups[key] = state
-        return state.upto(frame, end)
+        return state.upto(frame, end, bars)
 
     def describe(self) -> dict[str, Any]:
         return {
