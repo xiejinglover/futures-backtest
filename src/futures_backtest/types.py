@@ -112,6 +112,7 @@ class Fill:
     price: float
     commission: float
     slippage_ticks: float
+    slippage_cost: float
     realized_pnl: float
     status: str  # "filled" | "partial" | "rejected"
     reason: str

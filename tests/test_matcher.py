@@ -52,6 +52,82 @@ def test_slippage_is_charged_against_the_trader_and_snapped_to_the_tick():
     assert sell.price == pytest.approx(3499.0)
 
 
+def test_proportional_slippage_is_cash_charged_per_long_and_short_open_leg():
+    days = trading_days(4)
+    dataset, account, _, _ = make_parts(two_contract_tables(days, days[2]))
+    matcher = Matcher(dataset, ExecutionConfig(slippage_rate=0.000125))
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+    starting_cash = account.cash
+
+    long_fill = matcher.execute(_order(days[0], "buy", lots=2, price=3500.0), bar, account)[0]
+    short_fill = matcher.execute(_order(days[0], "sell", lots=3, price=3500.0), bar, account)[0]
+
+    assert long_fill.price == pytest.approx(3500.0)
+    assert short_fill.price == pytest.approx(3500.0)
+    assert long_fill.slippage_ticks == short_fill.slippage_ticks == 0.0
+    assert long_fill.slippage_cost == pytest.approx(2 * 3500 * 10 * 0.000125)
+    assert short_fill.slippage_cost == pytest.approx(3 * 3500 * 10 * 0.000125)
+    assert account.total_slippage == pytest.approx(
+        long_fill.slippage_cost + short_fill.slippage_cost
+    )
+    assert account.cash == pytest.approx(
+        starting_cash
+        - long_fill.commission
+        - short_fill.commission
+        - long_fill.slippage_cost
+        - short_fill.slippage_cost
+    )
+
+
+def test_proportional_slippage_is_charged_on_close_and_limit_fills():
+    days = trading_days(4)
+    dataset, account, _, _ = make_parts(two_contract_tables(days, days[2]))
+    matcher = Matcher(dataset, ExecutionConfig(slippage_rate=0.000125))
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+    opening = matcher.execute(
+        _order(days[0], "buy", lots=2, price=3495.0, limit_price=3494.0), bar, account
+    )[0]
+    closing = matcher.execute(
+        _order(days[0], "sell", offset="close", lots=2, price=3500.0), bar, account
+    )[0]
+
+    assert opening.slippage_cost == pytest.approx(2 * 3494 * 10 * 0.000125)
+    assert closing.slippage_cost == pytest.approx(2 * 3500 * 10 * 0.000125)
+    assert account.total_slippage == pytest.approx(
+        opening.slippage_cost + closing.slippage_cost
+    )
+
+
+def test_zero_proportional_slippage_matches_the_no_tick_path():
+    days = trading_days(4)
+    tables = two_contract_tables(days, days[2])
+    dataset, account, _, _ = make_parts(tables)
+    matcher = Matcher(dataset, ExecutionConfig(slippage_rate=0.0))
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+    fill = matcher.execute(_order(days[0], "buy", price=3500.0), bar, account)[0]
+
+    assert matcher.config.slippage_ticks == 0.0
+    assert fill.price == pytest.approx(3500.0)
+    assert fill.slippage_cost == 0.0
+
+
+def test_rate_slippage_does_not_adversely_snap_an_off_grid_reference():
+    days = trading_days(4)
+    dataset, account, _, _ = make_parts(two_contract_tables(days, days[2]))
+    matcher = Matcher(dataset, ExecutionConfig(slippage_rate=0.000125))
+    bar = dataset.last_bar_of_day("RB2405", days[0])
+
+    buy = matcher.execute(_order(days[0], "buy", price=3500.4), bar, account)[0]
+    assert buy.price == pytest.approx(3500.4)
+    assert buy.slippage_ticks == 0.0
+    assert buy.slippage_cost == pytest.approx(3500.4 * 10 * 0.000125)
+
+
+def test_tick_and_rate_slippage_cannot_be_stacked():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ExecutionConfig(slippage_ticks=1, slippage_rate=0.000125)
+
+
 def test_a_price_off_the_tick_grid_is_snapped_the_expensive_way():
     days = trading_days(4)
     dataset, account, _, _ = make_parts(two_contract_tables(days, days[2]))

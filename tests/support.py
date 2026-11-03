@@ -280,6 +280,36 @@ class HoldTwoLots:
         return TargetPosition(underlying="RB", net_lots=int(self.parameters.get("lots", 2)))
 
 
+class HoldLateListed:
+    """Trade AO only after the scheduler exposes it as routable."""
+
+    def __init__(self, parameters: dict[str, Any] | None = None):
+        self.parameters = dict(parameters or {})
+        self.seen_underlyings: list[tuple[str, ...]] = []
+
+    def on_bar(self, context):  # noqa: ANN001
+        from futures_backtest import TargetPosition
+
+        self.seen_underlyings.append(context.underlyings)
+        if "AO" not in context.underlyings:
+            return None
+        return TargetPosition(underlying="AO", net_lots=1)
+
+
+class TargetUnrouted:
+    """Deliberately bypass the daily universe to test the scheduler guard."""
+
+    def __init__(self, parameters: dict[str, Any] | None = None):
+        self.parameters = dict(parameters or {})
+
+    def on_bar(self, context):  # noqa: ANN001
+        from futures_backtest import TargetPosition
+
+        return TargetPosition(
+            underlying="AO", net_lots=int(self.parameters.get("net_lots", 1))
+        )
+
+
 class FlipStrategy:
     """Long on even bars, short on odd ones, to exercise reversals."""
 

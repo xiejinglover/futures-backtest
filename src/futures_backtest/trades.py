@@ -31,6 +31,7 @@ class Trade:
     holding_minutes: float
     gross_pnl: float
     commission: float
+    slippage_cost: float
     net_pnl: float
 
 
@@ -40,6 +41,7 @@ class _Lot:
     time: datetime
     price: float
     commission: float
+    slippage_cost: float
 
 
 class TradeLedger:
@@ -60,11 +62,20 @@ class TradeLedger:
         if fill.filled_lots <= 0:
             return
         per_lot = fill.commission / fill.filled_lots
+        slippage_per_lot = fill.slippage_cost / fill.filled_lots
         if fill.offset == "open":
             direction = "long" if fill.side == "buy" else "short"
             queue = self._open.setdefault((fill.symbol, direction), deque())
             for _ in range(fill.filled_lots):
-                queue.append(_Lot(fill.trading_day, fill.timestamp, fill.price, per_lot))
+                queue.append(
+                    _Lot(
+                        fill.trading_day,
+                        fill.timestamp,
+                        fill.price,
+                        per_lot,
+                        slippage_per_lot,
+                    )
+                )
             return
 
         direction = closing_direction(fill.side)
@@ -87,6 +98,7 @@ class TradeLedger:
                 lots += 1
             gross = sign * (fill.price - lot.price) * multiplier * lots
             commission = (lot.commission + per_lot) * lots
+            slippage_cost = (lot.slippage_cost + slippage_per_lot) * lots
             self.trades.append(
                 Trade(
                     underlying=fill.underlying,
@@ -102,7 +114,8 @@ class TradeLedger:
                     holding_minutes=(fill.timestamp - lot.time).total_seconds() / 60.0,
                     gross_pnl=gross,
                     commission=commission,
-                    net_pnl=gross - commission,
+                    slippage_cost=slippage_cost,
+                    net_pnl=gross - commission - slippage_cost,
                 )
             )
             start += lots

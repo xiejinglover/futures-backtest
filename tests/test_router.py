@@ -191,6 +191,19 @@ def test_missing_dominant_coverage_is_reported_with_the_lag():
         router.trading_symbol("RB", days[1])
 
 
+def test_lag_greater_than_one_does_not_borrow_window_records():
+    days = trading_days(6)
+    tables = two_contract_tables(days, days[3])
+    dataset, _, _, _ = make_parts(tables)
+    from futures_backtest import Router
+
+    router = Router(dataset, RoutingConfig(dominant_lag=2))
+    assert router.try_trading_symbol("RB", days[0]) is None
+    assert router.try_trading_symbol("RB", days[1]) is None
+    assert router.try_trading_symbol("RB", days[2]) == "RB2405"
+    assert router.warmup_fallbacks == set()
+
+
 def test_expiry_buffer_flattens_a_contract_near_its_last_trading_day():
     days = trading_days(6)
     tables = two_contract_tables(days, days[3])

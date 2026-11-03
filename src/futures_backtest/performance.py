@@ -94,6 +94,11 @@ def compute_metrics(frames: dict[str, pd.DataFrame], initial_cash: float) -> dic
     filled = fills[fills["filled_lots"] > 0] if not fills.empty else fills
     rejected = fills[fills["filled_lots"] == 0] if not fills.empty else fills
     commission = float(filled["commission"].sum()) if not filled.empty else 0.0
+    slippage = (
+        float(filled["slippage_cost"].sum())
+        if not filled.empty and "slippage_cost" in filled
+        else 0.0
+    )
     roll_commission = float(rolls["commission"].sum()) if not rolls.empty else 0.0
     roll_slippage = float(rolls["slippage_cost"].sum()) if not rolls.empty else 0.0
     roll_cost = roll_commission + roll_slippage
@@ -116,6 +121,7 @@ def compute_metrics(frames: dict[str, pd.DataFrame], initial_cash: float) -> dic
         "realized_pnl": float(nav["realized_pnl_cum"].iloc[-1]),
         "total_pnl": total_pnl,
         "commission": commission,
+        "slippage_cost": slippage,
         "orders": int(len(frames["orders"])),
         "fills": int(len(filled)),
         "rejections": int(len(rejected)),
@@ -125,6 +131,7 @@ def compute_metrics(frames: dict[str, pd.DataFrame], initial_cash: float) -> dic
         "rolls": int(len(rolls)),
         "roll_commission": roll_commission,
         "roll_slippage_cost": roll_slippage,
+        "non_roll_slippage_cost": slippage - roll_slippage,
         "roll_cost": roll_cost,
         "roll_cost_share_of_pnl": (roll_cost / abs(total_pnl)) if total_pnl else None,
         "average_margin_ratio": float((nav["margin"] / nav["equity"]).mean()),

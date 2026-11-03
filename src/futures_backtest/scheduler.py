@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
 import os
 import platform
 import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -99,10 +102,33 @@ class Scheduler:
         return bars
 
     def _routing(self, day: date) -> dict[str, str]:
-        return {
-            underlying: self.router.trading_symbol(underlying, day)
-            for underlying in self.config.data.underlyings
-        }
+        routing: dict[str, str] = {}
+        for underlying in self.config.data.underlyings:
+            symbol = self.router.try_trading_symbol(underlying, day)
+            if symbol is not None:
+                routing[underlying] = symbol
+        return routing
+
+    def _assert_routing_safety(self, day: date, routing: dict[str, str]) -> None:
+        """A missing lifecycle route is harmless only while nothing is held."""
+        for underlying in self.config.data.underlyings:
+            net = self.account.net_lots(underlying)
+            if net and underlying not in routing:
+                raise BacktestDataError(
+                    f"cannot route held position in {underlying} on {day}: net_lots={net}"
+                )
+
+    def _target_symbol(self, target: TargetPosition, day: date) -> str | None:
+        symbol = self.router.try_trading_symbol(target.underlying, day)
+        if symbol is not None:
+            return symbol
+        held = self.account.net_lots(target.underlying)
+        if held or target.net_lots:
+            raise BacktestDataError(
+                f"strategy targeted unrouted underlying {target.underlying} on {day}: "
+                f"target_lots={target.net_lots}, held_lots={held}"
+            )
+        return None
 
     def _bar_for(self, order: Order, bars: dict[str, Bar]) -> Bar:
         bar = bars.get(order.symbol)
@@ -175,7 +201,14 @@ class Scheduler:
             # Whatever is working belongs to the contract being left behind.
             self._cancel(self.book.cancel(underlying), day, "cancelled_on_roll")
             from_symbol = self.router.previous_trading_symbol(underlying, day)
-            to_symbol = self.router.trading_symbol(underlying, day)
+            to_symbol = self.router.try_trading_symbol(underlying, day)
+            if to_symbol is None:
+                net = self.account.net_lots(underlying)
+                if net:
+                    raise BacktestDataError(
+                        f"cannot route held position in {underlying} on {day}: net_lots={net}"
+                    )
+                continue
             net = self.account.symbol_net_lots(from_symbol) if from_symbol else 0
             self._record_event(
                 EventKind.ROLL,
@@ -194,13 +227,18 @@ class Scheduler:
                 continue
             out = [fill for fill in executed if fill.reason == "roll_out"]
             into = [fill for fill in executed if fill.reason == "roll_in"]
-            slippage_cost = sum(
-                fill.slippage_ticks
-                * self.dataset.contracts[fill.symbol].tick_size
-                * fill.filled_lots
-                * self.dataset.contracts[fill.symbol].multiplier
-                for fill in executed
-            )
+            if self.config.execution.slippage_rate is not None:
+                slippage_cost = sum(fill.slippage_cost for fill in executed)
+            else:
+                # Legacy tick slippage is embedded in fill prices, not deducted
+                # from cash as a second charge.
+                slippage_cost = sum(
+                    fill.slippage_ticks
+                    * self.dataset.contracts[fill.symbol].tick_size
+                    * fill.filled_lots
+                    * self.dataset.contracts[fill.symbol].multiplier
+                    for fill in executed
+                )
             self.rolls.append(
                 RollLog(
                     trading_day=day,
@@ -226,7 +264,11 @@ class Scheduler:
         """Execute each roll at its first slot with both contracts quoted."""
         for underlying in sorted(self.pending_rolls):
             old_symbol = self.router.previous_trading_symbol(underlying, day)
-            new_symbol = self.router.trading_symbol(underlying, day)
+            new_symbol = self.router.try_trading_symbol(underlying, day)
+            if new_symbol is None:
+                raise BacktestDataError(
+                    f"pending roll for {underlying} has no routed contract on {day}"
+                )
             net = self.account.symbol_net_lots(old_symbol) if old_symbol else 0
             if net and (old_symbol not in bars or new_symbol not in bars):
                 continue
@@ -249,6 +291,9 @@ class Scheduler:
     ) -> None:
         for pending in targets:
             signal_day, target = pending.signal_day, pending.target
+            routed = self._target_symbol(target, day)
+            if routed is None:
+                continue
             if self.router.is_roll_day(target.underlying, day) and not (
                 self.config.routing.allow_signals_on_roll_day
             ):
@@ -262,7 +307,6 @@ class Scheduler:
                     }
                 )
                 continue
-            routed = self.router.trading_symbol(target.underlying, day)
             if routed not in prices:
                 self.pending_targets[target.underlying] = pending
                 continue
@@ -452,7 +496,9 @@ class Scheduler:
         carried instead.
         """
         for target in targets:
-            symbol = self.router.trading_symbol(target.underlying, day)
+            symbol = self._target_symbol(target, day)
+            if symbol is None:
+                continue
             own_last_bar = self.dataset.last_bar_of_day(symbol, day)
             at_or_after_own_close = last or (
                 own_last_bar is not None and timestamp >= own_last_bar.timestamp
@@ -496,7 +542,10 @@ class Scheduler:
         for underlying, pending in list(self.pending_targets.items()):
             if underlying in self.pending_rolls:
                 continue
-            symbol = self.router.trading_symbol(underlying, day)
+            symbol = self._target_symbol(pending.target, day)
+            if symbol is None:
+                del self.pending_targets[underlying]
+                continue
             if symbol not in bars:
                 continue
             due.append(pending)
@@ -529,7 +578,7 @@ class Scheduler:
             bars_seen=self._bars_seen,
             bars=visible,
             account=self.account.snapshot(day),
-            underlyings=tuple(self.config.data.underlyings),
+            underlyings=tuple(routing),
             _history=self.dataset.history,
             _routing=routing,
             _tick_sizes={
@@ -540,6 +589,7 @@ class Scheduler:
         )
         result = self.strategy.on_bar(context)
         targets = normalize_targets(result, tuple(self.config.data.underlyings))
+        targets = [target for target in targets if self._target_symbol(target, day) is not None]
         if self.config.execution.market_fill == "same_close" and any(
             target.limit_price is not None or target.stop_price is not None for target in targets
         ):
@@ -570,6 +620,7 @@ class Scheduler:
                 "settlement_variation": outcome["settlement_variation"],
                 "realized_pnl_cum": self.account.realized_pnl,
                 "commission_cum": self.account.total_commission,
+                "slippage_cum": self.account.total_slippage,
                 "net_lots": json.dumps(snapshot.net_lots, sort_keys=True),
             }
         )
@@ -594,6 +645,8 @@ class Scheduler:
 
                 if first:
                     self.account.roll_today_into_yesterday()
+                    routing = self._routing(day)
+                    self._assert_routing_safety(day, routing)
                     if self.config.routing.roll_timing == "next_open":
                         self.pending_rolls.update(
                             underlying
@@ -644,10 +697,11 @@ class Scheduler:
                     if self.pending_rolls:
                         details = []
                         for underlying in sorted(self.pending_rolls):
+                            current = self.router.try_trading_symbol(underlying, day)
                             details.append(
                                 f"{underlying}:"
                                 f"{self.router.previous_trading_symbol(underlying, day)}->"
-                                f"{self.router.trading_symbol(underlying, day)}"
+                                f"{current}"
                             )
                         raise BacktestDataError(
                             f"cannot roll on {day}: no time slot had tradable bars for "
@@ -703,6 +757,14 @@ def run_backtest(
     identifier = run_id or _run_id(config, dataset.metadata.data_version)
     run_path = config.output.root / identifier
 
+    config_payload = json.loads(config.model_dump_json())
+    config_sha256 = hashlib.sha256(
+        json.dumps(config_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    strategy_source = inspect.getsourcefile(strategy.__class__)
+    strategy_sha256 = None
+    if strategy_source and os.path.isfile(strategy_source):
+        strategy_sha256 = hashlib.sha256(Path(strategy_source).read_bytes()).hexdigest()
     metadata = {
         "run_id": identifier,
         "created_at": datetime.now(UTC).isoformat(),
@@ -714,6 +776,18 @@ def run_backtest(
             {f"{underlying}@{day}" for underlying, day in scheduler.router.warmup_fallbacks}
         ),
         "strategy": config.strategy.path,
+        "strategy_source": strategy_source,
+        "strategy_sha256": strategy_sha256,
+        "config_sha256": config_sha256,
+        "execution_cost_model": {
+            "slippage_ticks": config.execution.slippage_ticks,
+            "slippage_rate": config.execution.slippage_rate,
+            "proportional_formula": (
+                "abs(filled_lots) * fill_price * contract_multiplier * slippage_rate"
+                if config.execution.slippage_rate is not None
+                else None
+            ),
+        },
         "python": sys.version.split()[0],
         "platform": platform.platform(),
         "pid": os.getpid(),
@@ -745,7 +819,9 @@ def validate_config(
     routing_preview = []
     for underlying in config.data.underlyings:
         for day in dataset.trading_days:
-            symbol = router.trading_symbol(underlying, day)
+            symbol = router.try_trading_symbol(underlying, day)
+            if symbol is None:
+                continue
             if router.is_roll_day(underlying, day):
                 routing_preview.append(
                     {

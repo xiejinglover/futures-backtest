@@ -14,10 +14,107 @@ from futures_backtest.types import BacktestDataError
 from tests import support
 from tests.support import (
     DictAdapter,
+    bar_rows,
     config_for,
     trading_days,
     two_contract_tables,
 )
+
+
+def _late_listing_tables(tables: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.DataFrame], list]:
+    tables = {name: frame.copy() for name, frame in tables.items()}
+    days = sorted(set(tables["bars"]["trading_day"]))
+    ao_bars = pd.DataFrame(
+        bar_rows(
+            "AO2409",
+            "AO",
+            days[3:],
+            [900 + 5 * index for index in range(len(days[3:]))],
+        )
+    )
+    tables["bars"] = pd.concat([tables["bars"], ao_bars], ignore_index=True)
+    tables["contracts"] = pd.concat(
+        [
+            tables["contracts"],
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": "AO2409",
+                        "underlying": "AO",
+                        "multiplier": 20,
+                        "tick_size": 1,
+                        "exchange": "SHFE",
+                        "expire_date": days[-1] + pd.Timedelta(days=180),
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    tables["dominant_map"] = pd.concat(
+        [
+            tables["dominant_map"],
+            pd.DataFrame(
+                [
+                    {
+                        "trading_day": day,
+                        "underlying": "AO",
+                        "dominant_symbol": "AO2409",
+                    }
+                    for day in days[3:]
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    tables["settles"] = pd.concat(
+        [
+            tables["settles"],
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": row.symbol,
+                        "trading_day": row.trading_day,
+                        "settle_price": row.close,
+                    }
+                    for row in ao_bars.itertuples(index=False)
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    tables["charges"] = pd.concat(
+        [
+            tables["charges"],
+            pd.DataFrame(
+                [
+                    {
+                        "underlying": "AO",
+                        "open_fee_rate": 0.0001,
+                        "close_fee_rate": 0.0001,
+                        "close_today_fee_rate": 0.001,
+                    }
+                ]
+            ),
+        ],
+        ignore_index=True,
+    )
+    tables["margins"] = pd.concat(
+        [
+            tables["margins"],
+            pd.DataFrame(
+                [{"underlying": "AO", "long_margin_rate": 0.1, "short_margin_rate": 0.12}]
+            ),
+        ],
+        ignore_index=True,
+    )
+    return tables, days
+
+
+def _late_config(tables, tmp_path, **kwargs):
+    config = config_for(tables, output_root=tmp_path, **kwargs)
+    config.data.underlyings = ["RB", "AO"]
+    return config
 
 
 def _run(tmp_path: Path, tables, **kwargs):
@@ -72,6 +169,34 @@ def test_the_roll_has_its_own_log_and_a_non_zero_cost(tmp_path, tables):
     roll_fills = fills[fills["reason"].isin(["roll_out", "roll_in"])]
     assert list(roll_fills["symbol"]) == ["RB2405", "RB2410"]
     assert list(roll_fills["offset"]) == ["close", "open"]
+
+
+def test_rate_slippage_reversal_and_rolls_are_all_charged_per_fill_leg(tmp_path, tables):
+    result = _run(
+        tmp_path,
+        tables,
+        strategy="tests.support:FlipStrategy",
+        execution={"slippage_rate": 0.000125},
+    )
+    fills = _frame(result, "fills")
+    filled = fills[fills["filled_lots"] > 0].copy()
+    expected = (
+        filled["filled_lots"].abs()
+        * filled["price"]
+        * 10.0
+        * 0.000125
+    )
+    assert filled["slippage_ticks"].eq(0).all()
+    assert filled["slippage_cost"].to_numpy() == pytest.approx(expected.to_numpy())
+    assert result.metrics["slippage_cost"] == pytest.approx(expected.sum())
+
+    rolls = _frame(result, "rolls")
+    roll_fills = filled[filled["reason"].isin(["roll_out", "roll_in"])]
+    assert len(roll_fills) == 2
+    assert rolls["slippage_cost"].sum() == pytest.approx(roll_fills["slippage_cost"].sum())
+
+    nav = _frame(result, "nav")
+    assert nav.iloc[-1]["slippage_cum"] == pytest.approx(expected.sum())
 
 
 def test_the_roll_happens_a_day_after_the_dominant_switch(tmp_path, tables):
@@ -275,6 +400,139 @@ def test_validate_reports_the_roll_schedule_without_trading(tables):
             "roll_from": "RB2405",
         }
     ]
+
+
+def test_late_listed_underlying_is_absent_until_its_lagged_route(tmp_path, tables):
+    tables, days = _late_listing_tables(tables)
+    config = _late_config(
+        tables,
+        tmp_path,
+        strategy="tests.support:HoldLateListed",
+    )
+    from futures_backtest import Scheduler, build_dataset
+    from futures_backtest.strategy import load_strategy
+
+    dataset = build_dataset(config.data, DictAdapter(tables))
+    strategy = load_strategy(config.strategy.path, config.strategy.parameters)
+    scheduler = Scheduler(config, dataset, strategy)
+    scheduler.run()
+
+    assert all("AO" not in seen for seen in strategy.seen_underlyings[:4])
+    assert "AO" in strategy.seen_underlyings[4]
+    assert ("AO", days[3]) not in scheduler.router.warmup_fallbacks
+    ao_orders = [order for order in scheduler.orders if order.underlying == "AO"]
+    assert ao_orders
+    assert min(order.trading_day for order in ao_orders) >= days[5]
+
+
+def test_validate_and_metadata_describe_late_listing(tmp_path, tables):
+    tables, days = _late_listing_tables(tables)
+    config = _late_config(
+        tables,
+        tmp_path,
+        strategy="tests.support:HoldLateListed",
+    )
+    report = validate_config(config, DictAdapter(tables))
+    coverage = report["data"]["dominant_coverage"]["AO"]
+    assert coverage == {
+        "first_dominant_day": days[3],
+        "starts_after_backtest_start": True,
+    }
+    assert not any(item["underlying"] == "AO" for item in report["rolls"])
+    assert f"AO@{days[3]}" not in report["dominant_warmup_fallbacks"]
+
+    result = run_backtest(config, DictAdapter(tables))
+    metadata = json.loads((result.run_path / "metadata.json").read_text())
+    assert metadata["data"]["dominant_coverage"]["AO"] == {
+        "first_dominant_day": str(days[3]),
+        "starts_after_backtest_start": True,
+    }
+
+
+def test_nonzero_target_for_unrouted_underlying_is_rejected(tmp_path, tables):
+    tables, _ = _late_listing_tables(tables)
+    config = _late_config(
+        tables,
+        tmp_path,
+        strategy="tests.support:TargetUnrouted",
+    )
+    with pytest.raises(BacktestDataError, match="targeted unrouted underlying AO"):
+        run_backtest(config, DictAdapter(tables))
+
+
+def test_configured_underlying_missing_from_dominant_map_is_rejected(tmp_path, tables):
+    tables, _ = _late_listing_tables(tables)
+    tables["dominant_map"] = tables["dominant_map"][
+        tables["dominant_map"]["underlying"] != "AO"
+    ]
+    config = _late_config(
+        tables,
+        tmp_path,
+        strategy="tests.support:HoldLateListed",
+    )
+    with pytest.raises(BacktestDataError, match="does not cover underlying AO"):
+        validate_config(config, DictAdapter(tables))
+
+
+def test_a_held_position_without_a_route_fails_loudly(tmp_path, tables):
+    tables, days = _late_listing_tables(tables)
+    config = _late_config(
+        tables,
+        tmp_path,
+        strategy="tests.support:HoldLateListed",
+    )
+    from futures_backtest import Scheduler, TargetPosition, build_dataset
+    from futures_backtest.strategy import load_strategy
+
+    dataset = build_dataset(config.data, DictAdapter(tables))
+    scheduler = Scheduler(
+        config,
+        dataset,
+        load_strategy(config.strategy.path, config.strategy.parameters),
+    )
+    routed_day = days[4]
+    bar = dataset.last_bar_of_day("AO2409", routed_day)
+    assert bar is not None
+    prices = {"AO2409": bar.open}
+    for order in scheduler.router.signal_orders(
+        TargetPosition("AO", 1),
+        routed_day,
+        bar.timestamp,
+        scheduler.account,
+        prices,
+    ):
+        scheduler.matcher.execute(order, bar, scheduler.account)
+
+    unrouted_day = days[3]
+    with pytest.raises(BacktestDataError, match=r"AO.*net_lots=1"):
+        scheduler._assert_routing_safety(  # noqa: SLF001 - explicit invariant test
+            unrouted_day, scheduler._routing(unrouted_day)
+        )
+
+
+def test_zero_target_for_unrouted_underlying_is_ignored(tmp_path, tables):
+    tables, _ = _late_listing_tables(tables)
+    config = _late_config(
+        tables,
+        tmp_path,
+        strategy="tests.support:TargetUnrouted",
+        parameters={"net_lots": 0},
+    )
+    result = run_backtest(config, DictAdapter(tables))
+    assert not (result.run_path / "orders.csv").read_text().strip()
+
+
+def test_builtin_strategy_tolerates_an_empty_daily_universe(tmp_path, tables):
+    days = sorted(set(tables["bars"]["trading_day"]))
+    tables["dominant_map"] = tables["dominant_map"][
+        tables["dominant_map"]["trading_day"] >= days[2]
+    ]
+    result = _run(
+        tmp_path,
+        tables,
+        strategy="futures_backtest.contrib.strategies:BuyAndHoldUnderlying",
+    )
+    assert result.status == "ok"
 
 
 def test_an_intraday_frequency_over_daily_data_is_refused(tmp_path, tables):

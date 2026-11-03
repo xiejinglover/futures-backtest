@@ -106,8 +106,22 @@ class Matcher:
             if lots <= 0:
                 return [self._reject(order, price, "insufficient_margin")]
             commission = self._commission(order.symbol, order.trading_day, "open", lots, price)
-            account.apply_open(order.symbol, direction, lots, price, commission)
-            return [self._fill(order, lots, price, commission, slippage_ticks, 0.0, lots)]
+            slippage_cost = self._slippage_cost(order.symbol, lots, price)
+            account.apply_open(
+                order.symbol, direction, lots, price, commission, slippage_cost
+            )
+            return [
+                self._fill(
+                    order,
+                    lots,
+                    price,
+                    commission,
+                    slippage_ticks,
+                    slippage_cost,
+                    0.0,
+                    lots,
+                )
+            ]
 
         direction = closing_direction(order.side)
         held = account.position(order.symbol, direction).lots
@@ -120,6 +134,7 @@ class Matcher:
             if portion <= 0:
                 continue
             commission = self._commission(order.symbol, order.trading_day, offset, portion, price)
+            slippage_cost = self._slippage_cost(order.symbol, portion, price)
             pnl = account.apply_close(
                 order.symbol,
                 direction,
@@ -127,9 +142,20 @@ class Matcher:
                 price,
                 commission,
                 from_today=offset == "close_today",
+                slippage_cost=slippage_cost,
             )
             fills.append(
-                self._fill(order, portion, price, commission, slippage_ticks, pnl, lots, offset)
+                self._fill(
+                    order,
+                    portion,
+                    price,
+                    commission,
+                    slippage_ticks,
+                    slippage_cost,
+                    pnl,
+                    lots,
+                    offset,
+                )
             )
         return fills
 
@@ -228,6 +254,10 @@ class Matcher:
     def _fill_price(
         self, side: str, reference: float, tick: float, bar: Bar
     ) -> tuple[float, float]:
+        if self.config.slippage_rate is not None:
+            # The rate model charges cash against the observed execution
+            # notional and must not quietly add adverse tick-price movement.
+            return min(max(self._clamp_to_limits(reference, bar), bar.low), bar.high), 0.0
         sign = 1.0 if side == "buy" else -1.0
         price = self._clamp_to_limits(
             _align(reference + sign * self.config.slippage_ticks * tick, tick, side), bar
@@ -350,6 +380,14 @@ class Matcher:
         notional = lots * info.multiplier * price
         return notional * charge.get(rate_key, 0.0) + lots * charge.get(lot_key, 0.0)
 
+    def _slippage_cost(self, symbol: str, lots: int, price: float) -> float:
+        """Cash slippage for the proportional model; tick slippage lives in price."""
+        rate = self.config.slippage_rate
+        if rate is None:
+            return 0.0
+        info = self.dataset.contracts[symbol]
+        return abs(lots) * price * info.multiplier * rate
+
     def _capacity(self, order: Order, bar: Bar) -> int:
         """Lots this bar can absorb under the participation cap.
 
@@ -383,6 +421,7 @@ class Matcher:
         price: float,
         commission: float,
         slippage_ticks: float,
+        slippage_cost: float,
         realized_pnl: float,
         total_filled: int,
         offset: str | None = None,
@@ -399,6 +438,7 @@ class Matcher:
             price=price,
             commission=commission,
             slippage_ticks=slippage_ticks,
+            slippage_cost=slippage_cost,
             realized_pnl=realized_pnl,
             status="filled" if total_filled == order.lots else "partial",
             reason=order.reason,
@@ -418,6 +458,7 @@ class Matcher:
             price=price,
             commission=0.0,
             slippage_ticks=0.0,
+            slippage_cost=0.0,
             realized_pnl=0.0,
             status="rejected",
             reason=order.reason,

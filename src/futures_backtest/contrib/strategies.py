@@ -16,6 +16,13 @@ from ..strategy import BaseStrategy, StrategyContext
 from ..types import TargetPosition
 
 
+def _available_underlying(context: StrategyContext, configured: object | None) -> str | None:
+    if configured is not None:
+        underlying = str(configured)
+        return underlying if underlying in context.underlyings else None
+    return context.underlyings[0] if context.underlyings else None
+
+
 class BuyAndHoldUnderlying(BaseStrategy):
     """Hold a fixed number of lots on one underlying.
 
@@ -23,7 +30,9 @@ class BuyAndHoldUnderlying(BaseStrategy):
     """
 
     def on_bar(self, context: StrategyContext) -> TargetPosition | None:
-        underlying = self.parameters.get("underlying", context.underlyings[0])
+        underlying = _available_underlying(context, self.parameters.get("underlying"))
+        if underlying is None:
+            return None
         lots = int(self.parameters.get("lots", 1))
         if context.bars_seen < int(self.parameters.get("warmup", 1)):
             return None
@@ -41,7 +50,9 @@ class MovingAverageCross(BaseStrategy):
     """
 
     def on_bar(self, context: StrategyContext) -> TargetPosition | None:
-        underlying = self.parameters.get("underlying", context.underlyings[0])
+        underlying = _available_underlying(context, self.parameters.get("underlying"))
+        if underlying is None:
+            return None
         window = int(self.parameters.get("window", 5))
         lots = int(self.parameters.get("lots", 1))
         allow_short = bool(self.parameters.get("allow_short", True))
@@ -78,7 +89,9 @@ class IntradayRangeBreakout(BaseStrategy):
     """
 
     def on_bar(self, context: StrategyContext) -> TargetPosition | None:
-        underlying = self.parameters.get("underlying", context.underlyings[0])
+        underlying = _available_underlying(context, self.parameters.get("underlying"))
+        if underlying is None:
+            return None
         lots = int(self.parameters.get("lots", 1))
         opening_bars = int(self.parameters.get("opening_bars", 4))
         offset = float(self.parameters.get("limit_offset_ticks", 0))

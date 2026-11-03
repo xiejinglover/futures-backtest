@@ -313,13 +313,6 @@ class MarketDataset:
             entries = self._dominant.get(underlying)
             if not entries:
                 raise BacktestDataError(f"dominant map does not cover underlying {underlying}")
-            first = entries[0][0]
-            required = self.trading_days[0]
-            if first > required:
-                raise BacktestDataError(
-                    f"dominant map does not cover {underlying} on {required}; "
-                    f"earliest record is {first}"
-                )
 
     # -- valuation --------------------------------------------------------
 
@@ -432,6 +425,16 @@ class MarketDataset:
             "fingerprint": self.metadata.fingerprint,
             "as_of": self.metadata.as_of,
             "underlyings": list(self.config.underlyings),
+            "dominant_coverage": {
+                underlying: {
+                    "first_dominant_day": self._dominant[underlying][0][0],
+                    "starts_after_backtest_start": (
+                        self._dominant[underlying][0][0] > self.config.start
+                    ),
+                }
+                for underlying in self.config.underlyings
+                if underlying in self._dominant
+            },
             "bar_freq": self.config.bar_freq,
             "trading_days": len(self.trading_days),
             "first_trading_day": self.trading_days[0],

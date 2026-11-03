@@ -159,6 +159,7 @@ data:
 | `routing.force_close_before_expiry_days` | 距最后交易日不足 N 天则强制平仓 |
 | `execution.market_fill` | 信号在 `next_open` 还是 `same_close` 成交 |
 | `execution.slippage_ticks` | 滑点，按最小变动价位计，方向始终不利于自己 |
+| `execution.slippage_rate` | 每个成交腿按 `abs(手数) × 成交价 × 乘数 × rate` 现金扣减；与非零 `slippage_ticks` 互斥 |
 | `execution.on_margin_short` | 保证金不足时 `reject` 还是 `scale`（缩手数） |
 | `execution.enforce_price_limits` | 涨停不可买、跌停不可卖 |
 | `execution.limit_fill_rule` | 限价单成交判定：`penetrate`（击穿才算，默认）或 `touch`（触及即算） |
@@ -255,6 +256,8 @@ DAY 委托存续到当日收盘，GTC 跨交易日保留。限价跳空开在限
 - `events.csv` 行数随 bar 数线性增长，1m 一年约 6 万行。
 - 策略看到的是**被路由合约的真实 bar**。用于特征的复权连续序列（signal view）属于
   Phase 2，届时仍不参与撮合。
+- `data.underlyings` 是回测关心的品种全集；`StrategyContext.underlyings` 只包含当日
+  有合法滞后主力映射的品种。中途上市的品种在上市前自动跳过，无需伪造映射。
 - 主力映射表最好比回测区间多一段历史，否则回测首日没有"前一日认定"可用，框架会退用
   当日记录并在 `metadata.json` 的 `dominant_warmup_fallbacks` 里记下这一次妥协。
 - 日终结算后若权益盖不住保证金，回测会**报错中止**（信息里给出权益与保证金），而不是

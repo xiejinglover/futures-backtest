@@ -22,6 +22,7 @@ class Account:
         self.positions: dict[tuple[str, str], Position] = {}
         self.realized_pnl = 0.0
         self.total_commission = 0.0
+        self.total_slippage = 0.0
 
     # -- position helpers -------------------------------------------------
 
@@ -61,7 +62,13 @@ class Account:
     # -- trading ----------------------------------------------------------
 
     def apply_open(
-        self, symbol: str, direction: str, lots: int, price: float, commission: float
+        self,
+        symbol: str,
+        direction: str,
+        lots: int,
+        price: float,
+        commission: float,
+        slippage_cost: float = 0.0,
     ) -> None:
         position = self.position(symbol, direction)
         total = position.lots + lots
@@ -69,8 +76,9 @@ class Account:
         position.lots = total
         position.today_lots += lots
         position.last_price = price
-        self.cash -= commission
+        self.cash -= commission + slippage_cost
         self.total_commission += commission
+        self.total_slippage += slippage_cost
 
     def apply_close(
         self,
@@ -80,6 +88,7 @@ class Account:
         price: float,
         commission: float,
         from_today: bool = False,
+        slippage_cost: float = 0.0,
     ) -> float:
         """Close ``lots`` of an existing side and return the realized PnL.
 
@@ -107,9 +116,10 @@ class Account:
         position.last_price = price
         if position.lots == 0:
             position.average_price = 0.0
-        self.cash += pnl - commission
+        self.cash += pnl - commission - slippage_cost
         self.realized_pnl += pnl
         self.total_commission += commission
+        self.total_slippage += slippage_cost
         return pnl
 
     def close_lots_split(self, symbol: str, direction: str, lots: int) -> tuple[int, int]:

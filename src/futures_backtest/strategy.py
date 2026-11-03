@@ -14,8 +14,9 @@ from .types import AccountSnapshot, BacktestDataError, Bar, TargetPosition
 class StrategyContext:
     """Everything a strategy may read, and nothing it may mutate.
 
-    ``history`` and ``bar`` stop at the current bar; asking for anything later
-    raises instead of quietly returning future data.
+    ``underlyings`` is the configured universe that has a valid routed contract
+    on this trading day. ``history`` and ``bar`` stop at the current bar; asking
+    for anything later raises instead of quietly returning future data.
     """
 
     trading_day: date

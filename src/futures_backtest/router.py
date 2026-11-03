@@ -25,43 +25,60 @@ class Router:
 
     # -- dominant resolution ----------------------------------------------
 
-    def trading_symbol(self, underlying: str, day: date) -> str:
-        """Contract the framework is allowed to trade for ``underlying`` on ``day``."""
-        reference = day
-        if self.config.dominant_lag:
+    def try_trading_symbol(self, underlying: str, day: date) -> str | None:
+        """Return today's routed contract, or ``None`` before an underlying lists.
+
+        Missing lifecycle coverage is a normal state. A mapping that names an
+        unknown contract remains a data error and is never hidden as unlisted.
+        """
+        if not self.config.dominant_lag:
+            reference = day
+        else:
             previous = self.dataset.previous_trading_day(day, self.config.dominant_lag)
-            # The first days of the window have no earlier day *inside* it, but the
-            # dominant map usually reaches further back, so ask the calendar day
-            # before rather than reusing the window's own first day.
-            reference = previous or (day - timedelta(days=1))
+            if previous is not None:
+                reference = previous
+            else:
+                # Before enough in-window trading days exist, only information
+                # published before the window is a valid lagged observation.
+                reference = self.dataset.trading_days[0] - timedelta(days=1)
         symbol = self.dataset.dominant_symbol(underlying, reference)
-        if symbol is None and reference < day:
-            # No published history before the window at all: the only record we can
-            # use is the one dated today, which is a one-off warm-up compromise.
+        if (
+            symbol is None
+            and self.config.dominant_lag == 1
+            and day == self.dataset.trading_days[0]
+        ):
+            # Preserve the documented one-off compromise only at the actual window
+            # boundary. A contract first mapped midway through a run must wait for
+            # the configured lag rather than borrowing same-day information.
             symbol = self.dataset.dominant_symbol(underlying, day)
             if symbol is not None:
                 self.warmup_fallbacks.add((underlying, day))
         if symbol is None:
-            raise BacktestDataError(
-                f"dominant map does not cover {underlying} on {reference} "
-                f"(needed to trade {day} with dominant_lag={self.config.dominant_lag})"
-            )
+            return None
         if symbol not in self.dataset.contracts:
             raise BacktestDataError(f"dominant symbol has no contract: {symbol}")
+        return symbol
+
+    def trading_symbol(self, underlying: str, day: date) -> str:
+        """Contract the framework is allowed to trade for ``underlying`` on ``day``."""
+        symbol = self.try_trading_symbol(underlying, day)
+        if symbol is None:
+            raise BacktestDataError(
+                f"dominant map has no lagged route for {underlying} "
+                f"(needed to trade {day} with dominant_lag={self.config.dominant_lag})"
+            )
         return symbol
 
     def previous_trading_symbol(self, underlying: str, day: date) -> str | None:
         previous = self.dataset.previous_trading_day(day, 1)
         if previous is None:
             return None
-        try:
-            return self.trading_symbol(underlying, previous)
-        except BacktestDataError:
-            return None
+        return self.try_trading_symbol(underlying, previous)
 
     def is_roll_day(self, underlying: str, day: date) -> bool:
         previous = self.previous_trading_symbol(underlying, day)
-        return previous is not None and previous != self.trading_symbol(underlying, day)
+        current = self.try_trading_symbol(underlying, day)
+        return previous is not None and current is not None and previous != current
 
     # -- order construction -----------------------------------------------
 
@@ -75,8 +92,15 @@ class Router:
     ) -> list[Order]:
         """Close whatever sits on the retired contract and reopen it on the new one."""
         old_symbol = self.previous_trading_symbol(underlying, day)
-        new_symbol = self.trading_symbol(underlying, day)
-        if old_symbol is None or old_symbol == new_symbol:
+        new_symbol = self.try_trading_symbol(underlying, day)
+        if old_symbol is None or new_symbol is None:
+            net = account.net_lots(underlying)
+            if net:
+                raise BacktestDataError(
+                    f"cannot route held position in {underlying} on {day}: net_lots={net}"
+                )
+            return []
+        if old_symbol == new_symbol:
             return []
         net = account.symbol_net_lots(old_symbol)
         orders: list[Order] = []
@@ -135,7 +159,14 @@ class Router:
         be meaningless, so those stay market orders.
         """
         underlying = target.underlying
-        symbol = self.trading_symbol(underlying, day)
+        symbol = self.try_trading_symbol(underlying, day)
+        if symbol is None:
+            current = account.net_lots(underlying)
+            if current:
+                raise BacktestDataError(
+                    f"cannot route held position in {underlying} on {day}: net_lots={current}"
+                )
+            return []
         current = account.net_lots(underlying)
         difference = int(target.net_lots) - current
         if difference == 0:

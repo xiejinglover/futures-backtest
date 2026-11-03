@@ -63,6 +63,10 @@ class RoutingConfig(StrictModel):
 class ExecutionConfig(StrictModel):
     market_fill: Literal["next_open", "same_close"] = "next_open"
     slippage_ticks: float = Field(default=1.0, ge=0)
+    # Proportional, cash-settled slippage charged on each individual fill leg.
+    # When supplied it replaces (rather than stacks with) price-based tick
+    # slippage.  ``None`` preserves the legacy one-tick default.
+    slippage_rate: float | None = Field(default=None, ge=0, lt=1)
     on_margin_short: Literal["reject", "scale"] = "reject"
     enforce_price_limits: bool = True
     # Daily bars hide queue position, so a limit that the day's extreme merely
@@ -76,6 +80,19 @@ class ExecutionConfig(StrictModel):
     # stand-in for depth, and a wrong guess is worse than none. It caps size
     # only, and says nothing about queue position.
     volume_participation: float | None = Field(default=None, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def exclusive_slippage_models(self) -> ExecutionConfig:
+        if self.slippage_rate is None:
+            return self
+        if "slippage_ticks" in self.model_fields_set and self.slippage_ticks != 0:
+            raise ValueError(
+                "execution.slippage_rate and a non-zero execution.slippage_ticks "
+                "are mutually exclusive"
+            )
+        # Supplying a rate opts out of the legacy one-tick default.
+        self.slippage_ticks = 0.0
+        return self
 
 
 class StrategyConfig(StrictModel):
